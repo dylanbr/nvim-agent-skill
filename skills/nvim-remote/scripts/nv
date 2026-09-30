@@ -1,0 +1,621 @@
+#!/usr/bin/env bash
+# nv — drive a running Neovim instance over its RPC socket.
+#
+# Socket resolution (first match wins):
+#   1. -s/--socket PATH flag, or $NVIM_SOCKET
+#   2. the user's Neovim, if exactly one is running (several: pick with -s;
+#      one that exists but doesn't respond: error, pointing at `nv doctor`)
+#   3. this session's managed headless server, auto-started in the cwd
+#
+# Managed servers are per agent session (ID "<agent>-<id>"; see init_session,
+# override with $NV_SESSION) and live in a private per-user directory. They
+# start with --clean (NV_USER_CONFIG=1 loads the user's config) and quit after
+# $NV_IDLE seconds idle (default 900) — never while a UI is attached or with
+# unsaved changes.
+#
+# Usage: nv [-s SOCKET] [-t SECONDS] <command> [args]
+#   list              List the user's live Neovims and all managed servers
+#   state             JSON snapshot: mode, file, cursor, visible lines, windows
+#   send KEYS         Type keys as if at the keyboard (<Esc>, <CR>, <C-w> etc.)
+#   cmd EXCMD         Run an Ex command, print its output (e.g. nv cmd 'ls')
+#   expr EXPR         Evaluate a Vimscript expression, print result as JSON
+#   lua CODE          Run Lua; print the returned value as JSON (strings raw)
+#   lua -f FILE       Run a Lua file; same output
+#   lines [A [B]]     Print buffer lines A..B (1-based, default whole buffer) with numbers
+#   escape            Return to normal mode, cancelling pending keys and prompts
+#   start             Start this session's managed server (no-op if running)
+#   stop              Stop this session's managed server (refuses with unsaved changes)
+#   attach            Print the command the user runs to watch the server live
+#   doctor            Diagnose an unresponsive Neovim and suggest a fix
+#   interrupt         Send CTRL-C (cancels :! commands, Vimscript loops, pending input;
+#                     cannot stop a pure-Lua infinite loop)
+#   kill [-9]         Last resort: SIGTERM (or SIGKILL) the Neovim process
+#
+# Exit status is non-zero on any failure, including Lua/Vimscript errors.
+
+set -uo pipefail
+
+TIMEOUT=${NV_TIMEOUT:-5}
+SOCKET=${NVIM_SOCKET:-}
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+RPC="$SCRIPT_DIR/nvrpc.py"
+_tmp=${TMPDIR:-/tmp}
+MANAGED_DIR=${NV_MANAGED_DIR:-${_tmp%/}/nv-$USER}
+SESSION_KEY=""      # set by init_session
+MANAGED_SOCKET=""
+TMPF=""
+LOCK=""
+trap '[ -n "$TMPF" ] && rm -f "$TMPF"; [ -n "$LOCK" ] && rmdir "$LOCK" 2>/dev/null' EXIT
+export NV_IDLE_LUA="$SCRIPT_DIR/idle.lua"
+
+die() { echo "nv: $*" >&2; exit 1; }
+warn() { echo "nv: $*" >&2; }
+
+# Run a command with a timeout (macOS has no coreutils `timeout` by default).
+# Exit status 142 means it timed out.
+with_timeout() { perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "$@"; }
+
+ensure_managed_dir() {
+  mkdir -p "$MANAGED_DIR" 2>/dev/null
+  [ -d "$MANAGED_DIR" ] && [ -O "$MANAGED_DIR" ] || die "$MANAGED_DIR is not a directory owned by you; refusing to use it"
+  chmod 700 "$MANAGED_DIR"
+}
+
+new_tmpfile() {
+  ensure_managed_dir
+  TMPF=$(mktemp "$MANAGED_DIR/tmp.XXXXXX") || die "mktemp failed"
+}
+
+# --- session identity -------------------------------------------------------------
+# Each `nv` call is a new process, so the session ID must be stable across calls.
+# It is "<agent name>-<id>", e.g. claude-code-1a2b3c4d, so warnings and `nv list`
+# show which agent owns what. Name: $AI_AGENT (set by Claude Code, e.g.
+# "claude-code_2-1-284_agent"), else the agent process's name. ID: $NV_SESSION
+# (used as the whole key), else Claude Code's session ID, else a random ID
+# remembered for the calling agent process, else one per directory.
+
+AGENT_PID="" AGENT_START="" AGENT_COMM=""
+
+# The agent process that ran us: the nearest ancestor that isn't a shell or
+# wrapper. Its start time guards against a reused PID.
+find_agent_process() {
+  local p=$PPID comm
+  while [ "${p:-1}" -gt 1 ]; do
+    comm=$(ps -o comm= -p "$p" 2>/dev/null) || return 1
+    comm=${comm##*/}; comm=${comm#-}
+    case $comm in
+      bash|zsh|fish|sh|dash|ksh|tcsh|csh|perl|env|timeout|nohup|xargs|sudo) ;;
+      *) AGENT_PID=$p AGENT_COMM=$comm AGENT_START=$(ps -o lstart= -p "$p"); return 0 ;;
+    esac
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+  done
+  return 1
+}
+
+# lowercase, [a-z0-9-] only, at most 12 chars
+slug() { printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | cut -c1-12 | sed 's/-*$//'; }
+
+init_session() {
+  local name="" id f
+  if [ -n "${NV_SESSION:-}" ]; then
+    [[ $NV_SESSION =~ ^[A-Za-z0-9_-]{1,32}$ ]] || die "NV_SESSION must be 1-32 letters, digits, _ or -"
+    SESSION_KEY=$NV_SESSION
+  else
+    find_agent_process
+    [ -n "${AI_AGENT:-}" ] && name=$(slug "${AI_AGENT%%_*}")
+    [ -z "$name" ] && [ -n "$AGENT_COMM" ] && name=$(slug "$AGENT_COMM")
+    [ -z "$name" ] && name=agent
+    if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+      id=${CLAUDE_CODE_SESSION_ID:0:8}
+    elif [ -n "$AGENT_PID" ]; then
+      ensure_managed_dir
+      mkdir -p "$MANAGED_DIR/sessions"
+      f="$MANAGED_DIR/sessions/$(printf '%s %s' "$AGENT_PID" "$AGENT_START" | cksum | cut -d' ' -f1)"
+      if [ ! -s "$f" ]; then
+        # noclobber: if parallel calls race, the first ID written wins
+        ( set -C; printf 'r%s\n' "$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')" > "$f" ) 2>/dev/null
+        find "$MANAGED_DIR/sessions" -type f -mtime +7 -delete 2>/dev/null
+      fi
+      id=$(cat "$f")
+    else
+      id=dir$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)
+    fi
+    SESSION_KEY=$name-$id
+  fi
+  MANAGED_SOCKET="$MANAGED_DIR/$SESSION_KEY.sock"
+}
+
+# --- process / socket inspection (never needs Neovim to respond) -------------
+
+socket_pid() { lsof -Fp -- "$1" 2>/dev/null | sed -n 's/^p//p' | head -1; }
+owned_by_nvim() { lsof -Fc -- "$1" 2>/dev/null | grep -qx 'cnvim'; }
+
+# Fast RPC: nvim_get_mode is answered even while Neovim waits for input.
+# Prints {"mode":"n","blocking":false} (no spaces, whichever path answers);
+# status 2 = no answer, 3 = can't connect.
+rpc_mode() {
+  local out
+  if command -v python3 >/dev/null 2>&1; then
+    out=$(python3 "$RPC" "$1" "${2:-1}" nvim_get_mode 2>/dev/null) || return
+  else
+    # Fallback can't answer while Neovim waits for input: that looks like "hung".
+    out=$(TIMEOUT=${2:-1} with_timeout nvim --server "$1" --remote-expr 'json_encode(nvim_get_mode())' 2>/dev/null) ||
+      return 2
+  fi
+  printf '%s\n' "${out// /}"
+}
+
+is_live() { rpc_mode "$1" 1 >/dev/null; }
+
+# Sockets of the user's own Neovims (managed servers excluded).
+user_sockets() {
+  local tmp=${TMPDIR:-/tmp}
+  {
+    find "${tmp%/}/nvim.$USER" -type s 2>/dev/null
+    find "${tmp%/}" -maxdepth 1 -type s \( -name '*nvim*' -o -name '*.sock' \) 2>/dev/null
+    [ -n "${XDG_RUNTIME_DIR:-}" ] && find "$XDG_RUNTIME_DIR" -maxdepth 2 -type s -name 'nvim*' 2>/dev/null
+    find /tmp -maxdepth 2 -type s \( -name '*nvim*' -o -name '*.sock' \) -user "$USER" 2>/dev/null
+  } | sort -u | while IFS= read -r s; do
+    case $s in "$MANAGED_DIR"/*) continue ;; esac
+    owned_by_nvim "$s" && echo "$s"
+  done
+}
+
+managed_sockets() { find "$MANAGED_DIR" -maxdepth 1 -type s -name '*.sock' 2>/dev/null; }
+
+# --- socket resolution --------------------------------------------------------
+
+resolve_socket() {
+  if [ -z "$SOCKET" ]; then
+    local all live="" s n
+    all=$(user_sockets)
+    while IFS= read -r s; do
+      [ -n "$s" ] && is_live "$s" && live="$live$s"$'\n'
+    done <<< "$all"
+    n=$(printf '%s' "$live" | grep -c . || true)
+    if [ "$n" -eq 1 ]; then
+      SOCKET=${live%$'\n'}
+    elif [ "$n" -gt 1 ]; then
+      warn "multiple Neovim instances; pick one with -s:"
+      cmd_list >&2
+      exit 1
+    elif [ -n "$all" ]; then
+      warn "found Neovim but it isn't responding:"
+      printf '%s\n' "$all" | sed 's/^/  /' >&2
+      die "diagnose with: nv -s <socket> doctor   (or use a managed server: nv start, then -s)"
+    else
+      start_managed >&2
+      SOCKET=$MANAGED_SOCKET
+    fi
+  fi
+  touch_socket
+}
+
+# Record this session's use; warn about other sessions and cwd mismatches.
+# Non-fatal and short, so it never blocks `send` to a Neovim waiting for input.
+touch_socket() {
+  local out prev age cwd
+  out=$(TIMEOUT=1 with_timeout nvim --server "$SOCKET" --remote-expr "luaeval('(function(me) local prev, t = vim.g.nv_session or \"\", vim.g.nv_session_time; vim.g.nv_session = me; vim.g.nv_session_time = os.time(); vim.g.nv_last_activity = vim.uv.now(); return prev .. \"|\" .. (t and (os.time() - t) or -1) .. \"|\" .. vim.fn.getcwd() end)(_A)', '$SESSION_KEY')" 2>/dev/null) || return 0
+  IFS='|' read -r prev age cwd <<< "$out"
+  if [ -n "$prev" ] && [ "$prev" != "$SESSION_KEY" ] && [ "$age" -ge 0 ] && [ "$age" -lt 600 ]; then
+    warn "another agent session ($prev) used this Neovim ${age}s ago — it may be acting concurrently. Re-check state before multi-step key sequences."
+  fi
+  case $SOCKET in "$MANAGED_DIR"/*)
+    # Neovim reports the resolved path (/tmp -> /private/tmp), so compare to pwd -P.
+    [ "$cwd" != "$(pwd -P)" ] && warn "server cwd is $cwd (you are in $PWD); relative paths resolve against the server cwd — use absolute paths."
+  esac
+  return 0
+}
+
+# --- managed server -------------------------------------------------------------
+
+unlock() { [ -n "$LOCK" ] && rmdir "$LOCK" 2>/dev/null; LOCK=""; }
+
+start_managed() {
+  ensure_managed_dir
+  is_live "$MANAGED_SOCKET" && return
+  # Lock so parallel calls in one session don't both start a server (the loser
+  # would delete the winner's socket and orphan it).
+  local i lock="$MANAGED_SOCKET.lock"
+  for i in $(seq 1 100); do
+    mkdir "$lock" 2>/dev/null && { LOCK=$lock; break; }
+    # stale lock from a crashed call
+    [ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ] && rmdir "$lock" 2>/dev/null
+    sleep 0.1
+  done
+  [ -n "$LOCK" ] || die "timed out waiting for $lock"
+  if is_live "$MANAGED_SOCKET"; then
+    unlock; return    # another call started it while we waited
+  fi
+  if [ -S "$MANAGED_SOCKET" ] && [ -n "$(socket_pid "$MANAGED_SOCKET")" ]; then
+    die "this session's managed Neovim exists but isn't responding — run: nv -s $MANAGED_SOCKET doctor"
+  fi
+  rm -f "$MANAGED_SOCKET"
+  local clean=(--clean)
+  [ -n "${NV_USER_CONFIG:-}" ] && clean=()
+  NV_IDLE=${NV_IDLE:-900} NV_SESSION=$SESSION_KEY \
+    nohup nvim --headless ${clean[@]+"${clean[@]}"} --listen "$MANAGED_SOCKET" \
+    -c "lua dofile(vim.env.NV_IDLE_LUA)" >/dev/null 2>&1 </dev/null &
+  disown
+  for i in $(seq 1 50); do
+    is_live "$MANAGED_SOCKET" && break
+    sleep 0.1
+  done
+  unlock
+  is_live "$MANAGED_SOCKET" || die "failed to start headless Neovim at $MANAGED_SOCKET"
+  echo "nv: started headless Neovim in $PWD (idle timeout ${NV_IDLE:-900}s, $([ ${#clean[@]} -eq 0 ] && echo 'user config' || echo '--clean'))"
+  echo "nv: user can watch it live with: nvim --server $MANAGED_SOCKET --remote-ui"
+}
+
+unsaved_count() {
+  TIMEOUT=2 with_timeout nvim --server "$1" --remote-expr 'len(filter(getbufinfo({"bufmodified": 1}), "index([\"\", \"acwrite\"], getbufvar(v:val.bufnr, \"&buftype\")) >= 0"))' 2>/dev/null
+}
+
+cmd_stop() {
+  local sock=${SOCKET:-$MANAGED_SOCKET} n pid i
+  case $sock in "$MANAGED_DIR"/*) ;; *) die "stop only stops managed servers; $sock is the user's editor" ;; esac
+  if ! is_live "$sock"; then
+    [ -S "$sock" ] && [ -n "$(socket_pid "$sock")" ] && die "server not responding — see: nv -s $sock doctor"
+    echo "nv: not running"
+    return
+  fi
+  n=$(unsaved_count "$sock") || die "couldn't check for unsaved changes (server not responding) — see: nv -s $sock doctor"
+  [ "$n" = "0" ] || die "server has $n unsaved buffer(s); save or discard them first"
+  pid=$(socket_pid "$sock")
+  # Via evaluation, not keystrokes: user mappings (NV_USER_CONFIG) can't interfere.
+  # The connection drops as Neovim exits, so the client's error is expected.
+  with_timeout nvim --server "$sock" --remote-expr 'execute("qall")' >/dev/null 2>&1
+  for i in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  kill -0 "$pid" 2>/dev/null && die "sent :qall but pid $pid is still running — see: nv -s $sock doctor"
+  echo "nv: stopped $sock"
+}
+
+# --- RPC helpers ----------------------------------------------------------------
+
+rexpr() {
+  local out rc
+  out=$(with_timeout nvim --server "$SOCKET" --remote-expr "$1" 2>&1); rc=$?
+  if [ $rc -eq 142 ] || [ $rc -eq 14 ]; then
+    die "timed out after ${TIMEOUT}s — Neovim is stuck or waiting for input. Run: nv -s $SOCKET doctor"
+  fi
+  [ $rc -ne 0 ] && die "remote-expr failed: $out"
+  printf '%s\n' "$out"
+}
+
+# Run a Lua file in Neovim. Strings are returned raw, everything else as JSON.
+# Errors go to stderr with a non-zero status. Returns rather than exits, so
+# callers (often in pipeline subshells, where the EXIT trap doesn't run) can
+# clean up their temp file.
+lua_file() {
+  local f=${1//\'/\'\'} out
+  out=$(rexpr "luaeval('(function(p) local ok, r = pcall(dofile, p) if not ok then return \"__NV_ERROR__\" .. tostring(r) end if type(r) == \"string\" then return r end local ok2, j = pcall(vim.json.encode, r == nil and vim.NIL or r) return ok2 and j or (\"__NV_ERROR__cannot return a \" .. type(r) .. \" as JSON: \" .. tostring(j)) end)(_A)', '$f')") || return 1
+  case $out in
+    __NV_ERROR__*) echo "nv: error: ${out#__NV_ERROR__}" >&2; return 1 ;;
+  esac
+  printf '%s\n' "$out"
+}
+
+# Write stdin-free Lua source to a temp file, run it, always clean up.
+run_lua_source() {
+  local rc
+  new_tmpfile
+  printf '%s\n' "$1" > "$TMPF"
+  lua_file "$TMPF"; rc=$?
+  rm -f "$TMPF"
+  return $rc
+}
+
+lua_code() { run_lua_source "$1"; }
+
+# Encode stdin as a Lua long-bracket string literal.
+lua_quote() {
+  local s eq=""
+  s=$(cat)
+  while [[ "$s" == *"]$eq]"* ]]; do eq="$eq="; done
+  printf '[%s[%s]%s]' "$eq" "$s" "$eq"
+}
+
+pretty() {
+  local out
+  out=$(cat)
+  if command -v jq >/dev/null 2>&1 && printf '%s' "$out" | jq . >/dev/null 2>&1; then
+    printf '%s' "$out" | jq .
+  else
+    printf '%s\n' "$out"
+  fi
+}
+
+# --- commands -------------------------------------------------------------------
+
+cmd_list() {
+  local s info who
+  while IFS= read -r s; do
+    [ -z "$s" ] && continue
+    if is_live "$s"; then
+      info=$(TIMEOUT=2 with_timeout nvim --server "$s" --remote-expr 'getcwd() .. "  [" .. (expand("%:p") == "" ? "no name" : expand("%:p")) .. "]"' 2>/dev/null || echo "(waiting for input)")
+      echo "$s  $info"
+    else
+      echo "$s  (NOT RESPONDING — nv -s $s doctor)"
+    fi
+  done < <(user_sockets)
+  while IFS= read -r s; do
+    [ -z "$s" ] && continue
+    who="other session"
+    [ "$s" = "$MANAGED_SOCKET" ] && who="this session"
+    if is_live "$s"; then
+      info=$(TIMEOUT=2 with_timeout nvim --server "$s" --remote-expr 'getcwd()' 2>/dev/null || echo "(waiting for input)")
+      echo "$s  (managed, $who)  $info"
+    elif [ -n "$(socket_pid "$s")" ]; then
+      echo "$s  (managed, $who, NOT RESPONDING)"
+    fi
+  done < <(managed_sockets)
+}
+
+STATE_LUA=$(cat <<'LUA'
+local api = vim.api
+local win = api.nvim_get_current_win()
+local buf = api.nvim_get_current_buf()
+local cur = api.nvim_win_get_cursor(win)
+local top = vim.fn.line('w0')
+local bot = vim.fn.line('w$')
+local lines = api.nvim_buf_get_lines(buf, top - 1, bot, false)
+local numbered = {}
+for i, l in ipairs(lines) do
+  numbered[#numbered + 1] = string.format('%4d%s %s', top + i - 1, (top + i - 1 == cur[1]) and '>' or ' ', l)
+end
+local wins = {}
+for _, w in ipairs(api.nvim_tabpage_list_wins(0)) do
+  local b = api.nvim_win_get_buf(w)
+  local cfg = api.nvim_win_get_config(w)
+  wins[#wins + 1] = {
+    id = w,
+    current = (w == win),
+    floating = cfg.relative ~= '',
+    buf = b,
+    name = api.nvim_buf_get_name(b),
+    filetype = vim.bo[b].filetype,
+  }
+end
+local diags = vim.diagnostic.count(buf)
+return {
+  mode = api.nvim_get_mode(),
+  cwd = vim.fn.getcwd(),
+  file = api.nvim_buf_get_name(buf),
+  filetype = vim.bo[buf].filetype,
+  buftype = vim.bo[buf].buftype,
+  modified = vim.bo[buf].modified,
+  line_count = api.nvim_buf_line_count(buf),
+  cursor = { line = cur[1], col = cur[2] + 1 },
+  visible = { top = top, bottom = bot, lines = numbered },
+  windows = wins,
+  tab = { current = vim.fn.tabpagenr(), count = vim.fn.tabpagenr('$') },
+  diagnostics = { error = diags[1] or 0, warn = diags[2] or 0, info = diags[3] or 0, hint = diags[4] or 0 },
+  ui_attached = #api.nvim_list_uis() > 0,
+  last_message = vim.trim(vim.fn.execute('1messages')),
+}
+LUA
+)
+
+cmd_send() {
+  [ $# -ge 1 ] || die "send needs KEYS"
+  with_timeout nvim --server "$SOCKET" --remote-send "$*" || die "send failed"
+}
+
+cmd_cmd() {
+  [ $# -ge 1 ] || die "cmd needs an Ex command"
+  run_lua_source "return vim.fn.execute($(printf '%s' "$*" | lua_quote))"
+}
+
+cmd_expr() {
+  [ $# -ge 1 ] || die "expr needs an expression"
+  run_lua_source "return vim.json.encode(vim.fn.eval($(printf '%s' "$*" | lua_quote)))"
+}
+
+cmd_lines() {
+  local a=${1:-1} b=${2:--1}
+  [[ $a =~ ^[0-9]+$ ]] && [[ $b =~ ^-?[0-9]+$ ]] || die "lines takes line numbers: nv lines [A [B]]"
+  lua_code "local a, b = math.max($a, 1), $b
+local buf = vim.api.nvim_get_current_buf()
+if b < 0 then b = vim.api.nvim_buf_line_count(buf) end
+local out = {}
+for i, l in ipairs(vim.api.nvim_buf_get_lines(buf, a - 1, b, false)) do
+  out[#out + 1] = string.format('%4d  %s', a + i - 1, l)
+end
+return table.concat(out, '\n')"
+}
+
+cmd_escape() {
+  # <Esc> first: cancels pending keys (z, g, operators), insert/visual mode,
+  # the cmdline and hit-enter prompts. Then <C-\><C-n> only if still needed
+  # (terminal mode). Sending <C-\><C-n> first would be wrong: after a pending
+  # `z` it is read as `z<C-\>` followed by <C-n> (cursor down).
+  local m
+  cmd_send '<Esc>'
+  sleep 0.1
+  m=$(rpc_mode "$SOCKET" 1) || m=""
+  case $m in
+    *'"blocking":false'*) case $m in *'"mode":"n"'*) ;; *) m="" ;; esac ;;
+    *) m="" ;;
+  esac
+  if [ -z "$m" ]; then
+    cmd_send '<C-\><C-n>'
+    sleep 0.1
+    m=$(rpc_mode "$SOCKET" 1) || die "no answer after escape — run: nv -s $SOCKET doctor"
+  fi
+  echo "$m"
+}
+
+# etime ([[dd-]hh:]mm:ss) -> seconds
+etime_secs() {
+  awk -v t="$1" 'BEGIN { d = 0; if (index(t, "-")) { split(t, a, "-"); d = a[1]; t = a[2] }
+    n = split(t, p, ":"); s = 0; for (i = 1; i <= n; i++) s = s * 60 + p[i]; print d * 86400 + s }'
+}
+
+# Resolve without requiring a response (the target may be hung).
+resolve_socket_offline() {
+  [ -n "$SOCKET" ] && return
+  local c n
+  # Other sessions' managed servers are never picked implicitly.
+  c=$( { user_sockets; [ -S "$MANAGED_SOCKET" ] && [ -n "$(socket_pid "$MANAGED_SOCKET")" ] && echo "$MANAGED_SOCKET"; } )
+  n=$(printf '%s' "$c" | grep -c . || true)
+  [ "$n" -eq 1 ] && { SOCKET=$c; return; }
+  [ "$n" -eq 0 ] && die "no Neovim found (other sessions' servers need an explicit -s; see nv list)"
+  warn "several Neovim sockets; pick one with -s:"
+  printf '%s\n' "$c" | sed 's/^/  /' >&2
+  exit 1
+}
+
+cmd_doctor() {
+  echo "socket:   $SOCKET"
+  [ -S "$SOCKET" ] || { echo "verdict:  no socket file — nothing is running here (stale path?)"; return; }
+  local pid
+  pid=$(socket_pid "$SOCKET")
+  if [ -z "$pid" ]; then
+    echo "verdict:  stale socket — no process owns it. Safe to delete: rm '$SOCKET'"
+    return
+  fi
+  local stat cpu etime nsecs
+  read -r stat cpu etime <<< "$(LC_ALL=C ps -o stat=,%cpu=,etime= -p "$pid")"
+  cpu=${cpu%%.*}
+  nsecs=$(etime_secs "$etime")
+  echo "process:  pid $pid  stat $stat  cpu ${cpu}%  up $etime"
+  echo "command:  $(ps -o command= -p "$pid")"
+
+  # When nothing answers and CPU is low, the youngest child is the prime
+  # suspect (:!cmd, system()). Children started with Neovim are usually
+  # plugins/LSP servers, but LSPs also start later, when files are opened.
+  local kids="" recent="" rsecs=-1 line cpid cstat ccpu cet ccmd csecs tag
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    read -r cpid cstat ccpu cet ccmd <<< "$line"
+    csecs=$(etime_secs "$cet")
+    tag="started ${csecs}s ago"
+    [ $((nsecs - csecs)) -lt 10 ] && tag="$tag, with Neovim"
+    kids="$kids          $cpid  $tag  $ccmd"$'\n'
+    if [ $rsecs -lt 0 ] || [ "$csecs" -lt $rsecs ]; then
+      recent=$cpid; rsecs=$csecs
+    fi
+  done < <(LC_ALL=C ps -A -o ppid=,pid=,stat=,%cpu=,etime=,command= | awk -v p="$pid" '$1 == p { $1 = ""; sub(/^ /, ""); print }')
+  if [ -n "$kids" ]; then echo "children:"; printf '%s' "$kids"; else echo "children: none"; fi
+
+  local m
+  if m=$(rpc_mode "$SOCKET" 2); then
+    echo "mode:     $m  (fast query answered)"
+    case $m in
+      *'"blocking":true'*)
+        echo "verdict:  WAITING FOR INPUT — an unfinished key sequence (e.g. z, g, \", an operator, a literal"
+        echo "          <leader>), a hit-enter/confirm prompt, or getchar()/input(). Neovim queues other RPC"
+        echo "          calls until the input arrives, so every nv command times out."
+        echo "fix:      nv -s $SOCKET escape   (or nv -s $SOCKET interrupt)"
+        return ;;
+    esac
+    if TIMEOUT=2 with_timeout nvim --server "$SOCKET" --remote-expr '1' >/dev/null 2>&1; then
+      case $m in
+        *'"mode":"n"'*) echo "verdict:  healthy" ;;
+        *) echo "verdict:  responsive, not in normal mode. nv escape returns to normal mode." ;;
+      esac
+      return
+    fi
+    echo "verdict:  answers fast queries but not evaluation — busy processing something."
+    echo "fix:      nv -s $SOCKET interrupt; re-run doctor."
+    return
+  fi
+
+  echo "mode:     no answer (not even the fast query)"
+  case $stat in
+    *T*)
+      echo "verdict:  process is STOPPED (e.g. the user pressed CTRL-Z in its terminal)."
+      echo "fix:      ask the user to run 'fg' in that terminal, or: kill -CONT $pid"
+      return ;;
+  esac
+  if [ "${cpu:-0}" -ge 50 ]; then
+    echo "verdict:  BUSY (${cpu}% CPU) — an infinite loop or a huge operation."
+    echo "fix:      nv -s $SOCKET interrupt   (works for Vimscript loops and most operations)."
+    echo "          If interrupt can't deliver CTRL-C, it's a pure-Lua loop: only kill -9 stops it."
+  elif [ -n "$recent" ]; then
+    echo "verdict:  probably waiting on its youngest child, pid $recent (started ${rsecs}s ago)."
+    echo "          If it's an LSP/plugin server rather than a :! command, the cause may be elsewhere."
+    echo "fix:      nv -s $SOCKET interrupt   (cancels it), or kill just that child PID, not Neovim."
+  else
+    echo "verdict:  idle but not answering — unusual. Possibly a blocking call inside a plugin."
+    echo "fix:      nv -s $SOCKET interrupt; re-run doctor. Last resort: nv kill (ask the user first if it's their editor)."
+  fi
+}
+
+cmd_interrupt() {
+  # Sent as input (nvim_input): Neovim reads it while running :! commands and
+  # Vimscript loops. NOT SIGINT — that terminates a headless Neovim.
+  with_timeout nvim --server "$SOCKET" --remote-send '<C-c>' 2>/dev/null ||
+    die "could not deliver CTRL-C — Neovim isn't reading input at all (likely a pure-Lua infinite loop). Only 'nv -s $SOCKET kill -9' stops it."
+  sleep 0.3
+  local m
+  if m=$(rpc_mode "$SOCKET" 2); then
+    echo "nv: Neovim is answering: $m"
+    case $m in *'"blocking":true'*) echo "nv: still waiting for input — follow up with: nv -s $SOCKET escape" ;; esac
+  else
+    die "CTRL-C delivered but Neovim still not answering. Try once more, then nv doctor / nv kill."
+  fi
+}
+
+cmd_kill() {
+  local sig=TERM pid i
+  case ${1:-} in
+    "") ;;
+    -9|-KILL) sig=KILL ;;
+    *) die "kill takes no argument or -9" ;;
+  esac
+  pid=$(socket_pid "$SOCKET")
+  [ -n "$pid" ] || die "no process owns $SOCKET"
+  owned_by_nvim "$SOCKET" || die "pid $pid owning $SOCKET is not nvim; refusing"
+  kill -"$sig" "$pid" || die "kill failed"
+  for i in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  kill -0 "$pid" 2>/dev/null && die "pid $pid still alive after SIG$sig. Use: nv -s $SOCKET kill -9"
+  echo "nv: killed Neovim pid $pid (SIG$sig). Unsaved work may be recoverable from swap: nvim -r <file>"
+  case $SOCKET in "$MANAGED_DIR"/*) rm -f "$SOCKET" ;; esac
+}
+
+usage() { sed -n '2,/^[^#]/p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'; }
+
+# --- arg parsing ------------------------------------------------------------------
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    -s|--socket)  [ $# -ge 2 ] || die "$1 needs a socket path"; SOCKET=$2; shift 2 ;;
+    -t|--timeout) [ $# -ge 2 ] && [[ $2 =~ ^[1-9][0-9]*$ ]] || die "$1 needs whole seconds (>= 1)"; TIMEOUT=$2; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) die "unknown option $1 (try nv --help)" ;;
+    *) break ;;
+  esac
+done
+
+[[ $TIMEOUT =~ ^[1-9][0-9]*$ ]] || die "NV_TIMEOUT must be whole seconds >= 1"
+[[ ${NV_IDLE:-900} =~ ^[0-9]+$ ]] && [ "${NV_IDLE:-900}" -ge 10 ] || die "NV_IDLE must be whole seconds >= 10"
+[ $# -ge 1 ] || { usage; exit 1; }
+command -v nvim >/dev/null || die "nvim not on PATH"
+init_session
+
+sub=$1; shift
+case $sub in
+  list)      cmd_list ;;
+  start)     start_managed ;;
+  stop)      cmd_stop ;;
+  attach)    echo "nvim --server ${SOCKET:-$MANAGED_SOCKET} --remote-ui" ;;
+  doctor)    resolve_socket_offline; cmd_doctor ;;
+  interrupt) resolve_socket_offline; cmd_interrupt ;;
+  kill)      resolve_socket_offline; cmd_kill "$@" ;;
+  escape)    resolve_socket_offline; cmd_escape ;;
+  state)     resolve_socket; lua_code "$STATE_LUA" | pretty ;;
+  send)      resolve_socket; cmd_send "$@" ;;
+  cmd)       resolve_socket; cmd_cmd "$@" ;;
+  expr)      resolve_socket; cmd_expr "$@" ;;
+  lua)       resolve_socket
+             if [ "${1:-}" = "-f" ]; then
+               [ -f "${2:-}" ] || die "lua -f needs an existing file"
+               lua_file "$(cd "$(dirname "$2")" && pwd)/$(basename "$2")" | pretty
+             else
+               [ $# -ge 1 ] || die "lua needs code"
+               lua_code "$*" | pretty
+             fi ;;
+  lines)     resolve_socket; cmd_lines "$@" ;;
+  *) die "unknown command: $sub (try nv --help)" ;;
+esac
