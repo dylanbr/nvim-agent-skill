@@ -164,7 +164,7 @@ Anyone who can connect to a Neovim socket has full control of that Neovim, inclu
 
 [AGENTS.md](AGENTS.md) describes the architecture and design rules for anyone, human or agent, working on the code.
 
-`tests/run.sh` starts its own headless Neovim and checks `nv`'s safe-edit commands and prompt handling against it (about 10–15 seconds). It never touches your running editor.
+`tests/run.sh` starts its own headless Neovim and checks `nv`'s safe-edit commands and prompt handling against it (about 10–15 seconds). It never touches your running editor. The tests are grouped into files in `tests/integration/`; `tests/run.sh prompts` runs just one.
 
 Bump `version` in `.claude-plugin/plugin.json` for each release: Claude Code only updates an installed plugin when that changes. Versions are `MAJOR.MINOR.PATCH`:
 

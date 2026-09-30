@@ -7,12 +7,13 @@ An Agent Skill (and Claude Code plugin) that lets an agent drive Neovim over its
 ## Commands
 
 ```sh
-tests/run.sh                          # full suite; needs nvim, perl, lsof, python3
+tests/run.sh                          # all tests; needs nvim, perl, lsof, python3
+tests/run.sh prompts unsaved          # only tests/integration/prompts.sh and unsaved.sh
 bash -n skills/nvim-remote/scripts/nv # syntax check
 skills/nvim-remote/scripts/nv --help  # usage, printed from the script's header comment
 ```
 
-There is no build or linter. The test suite is one sequential script sharing one server, so there's no way to run a single test; comment out sections if needed. It starts its own managed server (`NV_SESSION=nvtest-$$`) and passes `-s` on every call.
+There is no build or linter. Each file in `tests/integration/` is one group of checks, sourced in turn by `run.sh` with the helpers in `tests/lib.sh`. They share one managed test server, which `run.sh` resets between files (wiping buffers and messages) and replaces only if the reset can't confirm a known state. Test files must pass `-s` on every call (the `nv` helper does), work in their own `$DIR`, and change only buffer-local settings; the rules are at the top of `lib.sh`.
 
 When trying things by hand, never touch the user's running Neovim: set `NV_SESSION` to something unique, `nv start`, and pass `-s <socket>` (from `nv attach`) on every call. Keep socket paths under ~104 characters on macOS, or Neovim silently fails to listen (deep temp or scratch directories can be too long; `$TMPDIR` is fine).
 
