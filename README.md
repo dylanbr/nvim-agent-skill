@@ -80,3 +80,7 @@ All sessions share your own Neovim, since one editor can't be split between them
 ## Security
 
 Anyone who can connect to a Neovim socket has full control of that Neovim, including running shell commands. Managed server sockets live in a private per-user directory (mode 700). If you start Neovim with `--listen`, choose a path other users can't reach.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
