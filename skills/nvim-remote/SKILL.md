@@ -85,6 +85,15 @@ Where Neovim wins:
 
 Your own file tools are still better for small targeted edits and new files. `sed`/`perl` match `:s` for plain regex replacements.
 
+**Editing a file the user has open**: check with `$NV expr 'bufloaded("/abs/path")'` (symlinked paths match too). Edit that buffer by number rather than with `:edit`, which would switch the user's window:
+```lua
+local buf = vim.fn.bufnr("/abs/path")
+local had_changes = vim.bo[buf].modified
+vim.api.nvim_buf_set_lines(buf, 9, 12, false, {"new a", "new b"})
+if not had_changes then vim.api.nvim_buf_call(buf, function() vim.cmd("silent write") end) end
+```
+If the buffer already had unsaved changes (`had_changes`), don't write it: that would save the user's unfinished work too. Leave it unsaved and tell them.
+
 **Edited a file outside Neovim** (with your own tools) that the user has open? Run `nv cmd checktime`. Unmodified buffers reload, and the reload is itself undoable (files up to `'undoreload'`, 10000 lines by default), so the user can still press `u` to see or revert your change.
 
 ## Working loop

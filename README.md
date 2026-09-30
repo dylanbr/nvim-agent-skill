@@ -92,6 +92,18 @@ logical change, using the vim.api functions rather than keystrokes, then `:write
 generated changes.
 ```
 
+A middle option: route edits through Neovim only for files you already have open:
+
+```markdown
+Before editing a file, if my Neovim is running, check whether it's open
+(`nv expr 'bufloaded("/abs/path")'`). If it is, edit that buffer with the
+nvim-remote skill (by buffer number, without switching my window), one `nv lua`
+call per logical change, and save it unless it already had unsaved changes.
+Otherwise use your normal tools.
+```
+
+This also avoids conflicts when you have unsaved changes in a file the agent needs to edit.
+
 A lighter option: let the agent edit files normally, then refresh your editor:
 
 ```markdown
