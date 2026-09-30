@@ -272,10 +272,37 @@ cmd_stop() {
 
 # --- RPC helpers ----------------------------------------------------------------
 
+# What Neovim is waiting for, from an nvim_get_mode result; empty if not a prompt.
+prompt_kind() {
+  case $1 in
+    *'"mode":"r?"'*) echo "a yes/no confirm prompt (e.g. \"file has been changed since reading it\")" ;;
+    *'"mode":"rm"'*) echo "a -- More -- prompt" ;;
+    *'"mode":"r"'*)  echo "a hit-enter prompt" ;;
+    *'"mode":"c'*)   echo "the command line or an input() prompt" ;;
+    *'"blocking":true'*) echo "input to finish a key sequence or a getchar()" ;;
+  esac
+}
+
+# Who a prompt belongs to: the user's editor, or a managed server with or without a UI attached.
+socket_owner() {
+  case $SOCKET in
+    "$MANAGED_DIR"/*)
+      if ps -A -o command= | grep -F -- "--server $SOCKET" | grep -q -- '--remote-ui'; then
+        echo "a managed server with the user attached"
+      else
+        echo "a managed server with nobody attached"
+      fi ;;
+    *) echo "the user's own Neovim" ;;
+  esac
+}
+
 rexpr() {
-  local out rc
+  local out rc m kind
   out=$(with_timeout nvim --server "$SOCKET" --remote-expr "$1" 2>&1); rc=$?
   if [ $rc -eq 142 ] || [ $rc -eq 14 ]; then
+    if m=$(rpc_mode "$SOCKET" 1) && kind=$(prompt_kind "$m") && [ -n "$kind" ]; then
+      die "timed out after ${TIMEOUT}s — Neovim ($(socket_owner)) is waiting for $kind: $m. Answer only if you caused it and know what it asks; otherwise stop and tell the user. Details: nv -s $SOCKET doctor"
+    fi
     die "timed out after ${TIMEOUT}s — Neovim is stuck or waiting for input. Run: nv -s $SOCKET doctor"
   fi
   [ $rc -ne 0 ] && die "remote-expr failed: $out"
@@ -501,7 +528,13 @@ cmd_doctor() {
   local m
   if m=$(rpc_mode "$SOCKET" 2); then
     echo "mode:     $m  (fast query answered)"
+    local kind; kind=$(prompt_kind "$m")
     case $m in
+      *'"mode":"r'*|*'"mode":"c'*)
+        echo "verdict:  WAITING AT A PROMPT — $kind, in $(socket_owner)."
+        echo "fix:      answer it only if you caused it and know what it asks (nv -s $SOCKET send KEYS)."
+        echo "          Otherwise stop and tell the user; don't escape or interrupt their prompt."
+        return ;;
       *'"blocking":true'*)
         echo "verdict:  WAITING FOR INPUT — an unfinished key sequence (e.g. z, g, \", an operator, a literal"
         echo "          <leader>), a hit-enter/confirm prompt, or getchar()/input(). Neovim queues other RPC"

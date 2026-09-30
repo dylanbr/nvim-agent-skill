@@ -87,31 +87,53 @@ Your own file tools are still better for small targeted edits and new files. `se
 
 **Editing a file the user has open**: check with `$NV expr 'bufloaded("/abs/path")'` (symlinked paths match too). Edit that buffer by number rather than with `:edit`, which would switch the user's window.
 
-The buffer can differ from the file on disk, so don't take line numbers from a disk read. First run `checktime` on the buffer, then read the lines from the buffer itself. `checktime` reloads the buffer if the file changed on disk and it has no unsaved changes; if it does have them, they're kept and Neovim gives warning W12:
+The buffer can differ from the file on disk, so don't take line numbers from a disk read. First run `checktime` on the buffer, then read the lines from the buffer itself:
 ```lua
 local buf = vim.fn.bufnr("/abs/path")
 vim.v.warningmsg = ""
 vim.api.nvim_buf_call(buf, function() vim.cmd("checktime") end)
 return {
-  conflict = vim.v.warningmsg:match("^W12") ~= nil,  -- changed on disk and in the buffer
-  modified = vim.bo[buf].modified,                   -- the user has unsaved changes
+  warning = vim.v.warningmsg,          -- non-empty: stop (see below)
+  modified = vim.bo[buf].modified,     -- the user has unsaved changes
+  tick = vim.b[buf].changedtick,       -- pass to the edit call
   lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false),  -- or a range around the target
 }
 ```
-If `conflict` is true, change nothing: stop and tell the user. Otherwise, if `modified` is false, edit and save in one call:
-```lua
-local buf = vim.fn.bufnr("/abs/path")
-vim.api.nvim_buf_set_lines(buf, 9, 12, false, {"new a", "new b"})
-vim.api.nvim_buf_call(buf, function() vim.cmd("silent write") end)
-```
+`checktime` reloads the buffer if the file changed on disk and it has no unsaved changes (with 'autoread' on, the default). Anything else leaves a `warning`: W11 changed on disk but not reloaded ('autoread' off), W12 changed on disk *and* in the buffer, W13 created since it was opened, W16 permissions changed, E211 deleted. On any warning, change nothing: stop and tell the user what it says.
+
 If `modified` is true, the user has unsaved work in that buffer. Do what they've asked for (in their instructions or the request), and if they haven't said, use option 2:
 1. **Don't edit.** Stop and tell them to save or discard their changes before you can continue.
-2. **Edit, don't save** (default). Make the edit without the `write`. Your change is then only in the buffer, so tests, builds and anything else that reads the file won't see it. Stop and tell them to save the file before you can continue.
-3. **Save, edit, save.** Write the buffer first, in its own call, so their work is saved as they left it. Then edit and save as above.
+2. **Edit, don't save** (default). Make the edit with `save = false`. Your change is then only in the buffer, so tests, builds and anything else that reads the file won't see it. Stop and tell them to save the file before you can continue.
+3. **Save, edit, save.** First write the buffer in its own call (`silent write` in `nvim_buf_call`), so their work is saved as they left it. Then re-read and edit as for an unmodified buffer.
 
 Never pick a more forceful option than the user asked for, and never save their unsaved work unless they chose option 3.
 
-A `write` can still find the file changed on disk: W12 is only given once, and the file can change between calls. Neovim then asks "file has been changed since reading it … (y/n)?", `silent` doesn't suppress it, and `nv` times out with the mode at `r?`. Answer `$NV send n`. That declines, so nothing is written and the buffer is left as it was. Then stop and tell the user. Never answer `y`.
+Then edit, in a separate call. It re-checks first and changes nothing if the buffer moved on since the read:
+```lua
+local buf, tick, save = vim.fn.bufnr("/abs/path"), 42, true  -- tick from the read; save = false for option 2
+vim.v.warningmsg = ""
+vim.api.nvim_buf_call(buf, function() vim.cmd("checktime") end)
+if vim.v.warningmsg ~= "" or vim.b[buf].changedtick ~= tick then
+  return "changed since read: " .. vim.v.warningmsg
+end
+local autoread = vim.api.nvim_get_option_value("autoread", { buf = buf })
+if autoread == nil then autoread = vim.go.autoread end
+if save and not autoread and not vim.deep_equal(vim.api.nvim_buf_get_lines(buf, 0, -1, false),
+    vim.fn.readfile(vim.api.nvim_buf_get_name(buf))) then
+  return "stale: the buffer differs from the file on disk"
+end
+vim.api.nvim_buf_set_lines(buf, 9, 12, false, {"new a", "new b"})
+if save then vim.api.nvim_buf_call(buf, function() vim.cmd("silent write") end) end
+return "ok"
+```
+- **Changed since read:** the user typed in the buffer or the file was reloaded, so your line numbers may be wrong. Re-read and try once more; if it changes again, stop and tell the user.
+- **Stale:** with 'autoread' off, `checktime` warns only once, so an earlier warning (when the user switched back to Neovim, say) would hide it. Comparing with the file catches that. A difference in line endings or encoding can also trigger it; either way, stop and tell the user.
+
+A `write` can still hit a prompt, for example if the file changes between the check and the write. Neovim asks "file has been changed since reading it … (y/n)?", `silent` doesn't suppress it, and `nv` times out, reporting what Neovim is waiting for and whose editor it is. Only answer a prompt you caused and understand:
+- **A managed server nobody is attached to:** answer this write prompt with `$NV send n`. That declines, so nothing is written. Then stop and work out why the file changed.
+- **The user's own Neovim, or a managed server they're attached to:** leave the prompt. Stop and tell the user their Neovim is asking whether to overwrite a file that changed on disk. It's their decision.
+
+Never answer `y`, and never `escape` or `interrupt` a prompt in the user's editor.
 
 **Edited a file outside Neovim** (with your own tools) that the user has open? Run `nv cmd checktime`. Unmodified buffers reload, and the reload is itself undoable (files up to `'undoreload'`, 10000 lines by default), so the user can still press `u` to see or revert your change.
 
@@ -143,7 +165,8 @@ A `write` can still find the file changed on disk: W12 is only given once, and t
 
 | Verdict | What doctor sees | Fix |
 |---|---|---|
-| **Waiting for input**: unfinished key sequence, hit-enter/confirm prompt, `getchar()`/`input()` | Fast query answers with `blocking: true`; everything else times out | `$NV escape` (safe: doesn't move the cursor) |
+| **Waiting for input**: unfinished key sequence, `getchar()` | Fast query answers with `blocking: true`; everything else times out | `$NV escape` (safe: doesn't move the cursor) |
+| **Waiting at a prompt**: confirm (`r?`), hit-enter (`r`), `-- More --` (`rm`), `input()` (`c`) | Mode starts with `r` or `c`; doctor says whose editor it is | Answer only a prompt you caused and understand. Otherwise, or in the user's editor, leave it and tell the user. |
 | **Waiting on a child process**: `:!cmd`, `system()` | No answer, ~0% CPU, a shell child (`sh -c …`) or other recently started child. A non-shell child may just be an LSP server; read the children list. | `$NV interrupt` cancels it. Or kill only that child PID, not Neovim. |
 | **Busy**: Vimscript infinite loop or huge operation | No answer, high CPU | `$NV interrupt` |
 | **Busy: pure-Lua infinite loop** | No answer, high CPU, and `interrupt` says "could not deliver CTRL-C" | Only `$NV kill -9`. Lua loops never check for interrupts and ignore SIGTERM. |
