@@ -61,6 +61,46 @@ nvim --server <socket> --remote-ui
 
 Run `nv --help` for all commands, and see [SKILL.md](skills/nvim-remote/SKILL.md) for the full guide the agent follows.
 
+## Editing through Neovim
+
+By default the agent uses Neovim when you ask it to. Beyond that, the skill is useful in two ways.
+
+**If you work in Neovim alongside the agent**, it streamlines that workflow:
+- **You see changes happen** in your editor as the agent makes them.
+- **Undo works on the agent's changes.** Each change the agent makes is one undo step, so `u` reverts it and `:earlier 5m` rolls back further.
+- **Your buffers stay in sync:** no "file changed on disk" prompts.
+
+**Some edits are quicker or more correct in Neovim**, even when you're not watching:
+- **LSP edits:** renaming a symbol across the project, code actions, formatting. These are semantically correct, where find-and-replace also hits comments and strings.
+- **Structural edits in one command:** `:g/pattern/normal A;`, `:sort u`, `:%!jq .`, re-indenting.
+- **Large files:** changing one spot without reading the whole file.
+- **Multi-file edits:** `:vimgrep` into the quickfix list, then `:cfdo s/old/new/ge | update`.
+
+The skill tells the agent about both. Small edits and new files still go through the agent's normal tools, which are faster for those.
+
+Managed headless servers keep undo history too: attach and press `u`, or ask the agent to undo. The history ends when the server quits after its idle timeout.
+
+### Making it the default
+
+To have the agent route edits through your editor whenever it's open, add something like this to your `CLAUDE.md` or `AGENTS.md`:
+
+```markdown
+When my Neovim is running (`nv list` shows it), make code edits through it with the
+nvim-remote skill so I can watch and undo them: one `nv lua`/`nv cmd` call per
+logical change, using the vim.api functions rather than keystrokes, then `:write`
+(undo still works after saving). Use your normal tools for new files and bulk
+generated changes.
+```
+
+A lighter option: let the agent edit files normally, then refresh your editor:
+
+```markdown
+After editing files, if my Neovim is running, run `nv cmd checktime` so my open
+buffers reload.
+```
+
+Reloading is undoable too (for files up to 10,000 lines, Neovim's `undoreload` default), so `u` still reverts the agent's change. You just don't watch it happen.
+
 ## Sessions
 
 Each agent session gets its own managed server, named `<agent>-<id>` (for example `claude-code-1a2b3c4d`).

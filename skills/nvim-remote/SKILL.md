@@ -1,6 +1,6 @@
 ---
 name: nvim-remote
-description: Drive Neovim live over its RPC socket — the user's running editor, or a managed headless one started on demand — to send keystrokes, run Ex commands, evaluate Vimscript/Lua, and read editor state (mode, cursor, visible lines, windows, diagnostics). Use when the user asks you to drive, control, pair in, or do something "in/with/using nvim/neovim/vim" or this skill, or to connect to a Neovim socket. Not for plain file edits the user didn't ask to happen through Neovim.
+description: Drive Neovim live over its RPC socket — the user's running editor, or a managed headless one started on demand — to send keystrokes, run Ex commands, evaluate Vimscript/Lua, and read editor state (mode, cursor, visible lines, windows, diagnostics). Use when the user asks you to drive, control, pair in, or do something "in/with/using nvim/neovim/vim" or this skill, or to connect to a Neovim socket. Also use when an edit is quicker or safer in Neovim: LSP rename/code actions/formatting, :g/:normal/:sort-style structural edits, targeted edits in large files, or changes the user may want to review and undo step by step. Not for small edits or new files, which your own tools do in one step.
 ---
 
 # nvim-remote
@@ -68,6 +68,25 @@ If the user has one Neovim of their own and several agent sessions use it, they 
 
 Global flags: `-s SOCKET`, `-t SECONDS` (per-call timeout, default 5, min 1). Env: `NV_IDLE` (min 10), `NV_USER_CONFIG=1`, `NV_TIMEOUT`, `NVIM_SOCKET` (same as `-s`), `NV_SESSION` (session ID override).
 
+## When to edit through Neovim
+
+Two reasons, beyond being asked to:
+
+1. **The user works in Neovim alongside you.** Editing through their editor keeps them in the loop: they see each change as it happens, `u` undoes it, and their buffers never go stale.
+2. **Neovim is quicker or more correct for the edit**, whether or not anyone is watching. See the list below.
+
+Where Neovim wins:
+
+- **LSP edits**: `vim.lsp.buf.rename()`, code actions, `vim.lsp.buf.format()`. They're semantically correct, unlike text replacement, which also hits comments and strings. They need a language server: the user's Neovim, or a managed server started with `NV_USER_CONFIG=1`.
+- **Structural edits in one command**: `:g/pat/normal A;`, `:g/pat/d`, `:'<,'>sort u`, `:%!jq .`, `=` to re-indent, text objects. Each replaces many individual edits.
+- **Large files**: jump to and change one spot without reading the whole file into context.
+- **Multi-file edits with review**: `:vimgrep /pat/ **/*.ts`, then `:cfdo s/old/new/ge | update`.
+- **Undo**: every `nv lua` or `nv cmd` call is **one undo step**, even with several edits inside it. `nv cmd undo` takes back your last change precisely; `:earlier 2m` rolls back further. The user can attach (or look at their editor) and press `u` to step back through your work. On a managed server the history lasts only as long as the server, which quits after `NV_IDLE` idle.
+
+Your own file tools are still better for small targeted edits and new files. `sed`/`perl` match `:s` for plain regex replacements.
+
+**Edited a file outside Neovim** (with your own tools) that the user has open? Run `nv cmd checktime`. Unmodified buffers reload, and the reload is itself undoable (files up to `'undoreload'`, 10000 lines by default), so the user can still press `u` to see or revert your change.
+
 ## Working loop
 
 1. **Look before acting.** Run `$NV state` first to see the mode, file and what's on screen.
@@ -118,7 +137,7 @@ Re-run `doctor` after each fix until it says `healthy`.
 
 - It's the user's live editor. Don't `:q`, `:qa!`, `:bd!` or discard unsaved changes (`modified: true`) unless they asked for it. Ask before `:w` unless saving is clearly part of the request.
 - The user may be typing at the same time. If state changes unexpectedly between calls, assume they did it, re-read the state, and don't fight them.
-- Keep changes undoable. Normal edits are, and the user can press `u`. Mention that for big changes.
+- Keep changes undoable. Normal edits are, and the user can press `u`. Group each logical change into one `lua`/`cmd` call so it's one undo step, and mention `u` for big changes.
 - Anyone with access to a socket gets full control of that Neovim, including shell commands via `:!`. Remind the user if they choose a `--listen` path in a shared or world-readable location.
 - Socket paths must be under ~104 characters on macOS; longer paths fail with "connection refused".
 
