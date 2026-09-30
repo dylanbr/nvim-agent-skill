@@ -97,12 +97,20 @@ A middle option: route edits through Neovim only for files you already have open
 ```markdown
 Before editing a file, if my Neovim is running, check whether it's open
 (`nv expr 'bufloaded("/abs/path")'`). If it is, edit that buffer with the
-nvim-remote skill (by buffer number, without switching my window), one `nv lua`
-call per logical change, and save it unless it already had unsaved changes.
-Otherwise use your normal tools.
+nvim-remote skill (by buffer number, without switching my window): run
+`checktime` on it and read the lines from the buffer, not the file on disk. Make
+one `nv lua` call per logical change, and save it. If it already had unsaved
+changes, don't save it: stop and tell me to save it before you continue.
+If the file isn't open, use your normal tools.
 ```
 
-This also avoids conflicts when you have unsaved changes in a file the agent needs to edit.
+This also avoids conflicts when you have unsaved changes in a file the agent needs to edit. For that case, the skill has three options, and you can set a different default in the snippet or ask per request:
+
+1. **Don't edit**: the agent stops and asks you to save or discard first.
+2. **Edit, don't save** (the default): the agent's change joins yours in the buffer, and it stops until you save.
+3. **Save, edit, save**: the agent saves your work first, then makes its change and saves again. `u` still reverts just the agent's change.
+
+If the file also changed on disk, or anything else unexpected comes up, the agent stops and tells you rather than forcing a save.
 
 A lighter option: let the agent edit files normally, then refresh your editor:
 
