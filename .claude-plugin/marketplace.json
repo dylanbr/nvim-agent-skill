@@ -1,0 +1,18 @@
+{
+  "name": "nvim-agent-skill",
+  "owner": {
+    "name": "Dylan Bridgman"
+  },
+  "metadata": {
+    "description": "Neovim agent skill for Claude Code and other AI coding agents"
+  },
+  "plugins": [
+    {
+      "name": "nvim-agent-skill",
+      "source": "./",
+      "description": "Drive Neovim live over its RPC socket: your running editor or a managed headless one.",
+      "category": "development",
+      "homepage": "https://github.com/dylanbr/nvim-agent-skill"
+    }
+  ]
+}

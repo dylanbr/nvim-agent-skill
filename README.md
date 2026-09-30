@@ -18,7 +18,14 @@ The agent can work in **your running Neovim** while you watch, or in a **headles
 
 The skill is the `skills/nvim-remote` directory, in the [Agent Skills](https://agentskills.io) format (`SKILL.md` plus scripts).
 
-**Claude Code:** copy or symlink it into your personal or project skills directory:
+**Claude Code (plugin):** this repo is also a plugin marketplace:
+
+```
+/plugin marketplace add dylanbr/nvim-agent-skill
+/plugin install nvim-agent-skill@nvim-agent-skill
+```
+
+**Claude Code (manual):** copy or symlink the skill into your personal or project skills directory:
 
 ```sh
 ln -s "$PWD/skills/nvim-remote" ~/.claude/skills/nvim-remote        # all projects
