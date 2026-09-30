@@ -34,6 +34,20 @@ ln -s "$PWD/skills/nvim-remote" .claude/skills/nvim-remote          # one projec
 
 **Other agents:** put `skills/nvim-remote` wherever your agent loads Agent Skills from.
 
+### Permissions
+
+Every `nv` call is a Bash command, so Claude Code asks you to approve each one unless you allow it. The agent calls `nv` by its absolute path, so allow that path (shown in the approval prompt) in your settings, or pick "don't ask again" there:
+
+```json
+{ "permissions": { "allow": ["Bash(/Users/you/.claude/skills/nvim-remote/scripts/nv *)"] } }
+```
+
+With the plugin, the path is under `~/.claude/plugins/cache/` and includes the plugin's version, so the rule needs updating after each plugin update. A manual install (above) has a path that doesn't change.
+
+To keep the rule matching, the skill tells the agent to pass text to `nv` with a heredoc rather than a pipe.
+
+Allowing `nv` lets the agent run anything in your Neovim, including shell commands through it (see [Security](#security)).
+
 ### Requirements
 
 - Neovim 0.10+ (tested on 0.12)
@@ -95,16 +109,12 @@ generated changes.
 A middle option: route edits through Neovim only for files you already have open:
 
 ```markdown
-Before editing a file, if my Neovim is running, check whether it's open
-(`nv expr 'bufloaded("/abs/path")'`). If it is, edit that buffer with the
-nvim-remote skill (by buffer number, without switching my window): run
-`checktime` on it and read the lines from the buffer, not the file on disk. Make
-one `nv lua` call per logical change, and save it. If it already had unsaved
-changes, don't save it: stop and tell me to save it before you continue.
-If the file isn't open, use your normal tools.
+Before editing a file, if my Neovim is running, edit it with the nvim-remote
+skill's `nv buf` commands: `nv buf read`, then one `nv buf edit --save` per
+logical change. If the file isn't open (exit 3), use your normal tools.
 ```
 
-This also avoids conflicts when you have unsaved changes in a file the agent needs to edit. For that case, the skill has three options, and you can set a different default in the snippet or ask per request:
+`nv buf` edits the open buffer without switching your window, takes line numbers from the buffer rather than the file on disk, and runs the safety checks below. This also avoids conflicts when you have unsaved changes in a file the agent needs to edit. For that case, the skill has three options, and you can set a different default in the snippet (e.g. "if the file has unsaved changes, save them first") or ask per request:
 
 1. **Don't edit**: the agent stops and asks you to save or discard first.
 2. **Edit, don't save** (the default): the agent's change joins yours in the buffer, and it stops until you save.
@@ -147,6 +157,12 @@ All sessions share your own Neovim, since one editor can't be split between them
 ## Security
 
 Anyone who can connect to a Neovim socket has full control of that Neovim, including running shell commands. Managed server sockets live in a private per-user directory (mode 700). If you start Neovim with `--listen`, choose a path other users can't reach.
+
+## Development
+
+`tests/run.sh` starts its own headless Neovim and checks `nv`'s safe-edit commands and prompt handling against it (about 15 seconds). It never touches your running editor.
+
+Bump `version` in `.claude-plugin/plugin.json` for each release: Claude Code only updates an installed plugin when that changes.
 
 ## License
 

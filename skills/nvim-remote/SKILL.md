@@ -57,6 +57,7 @@ If the user has one Neovim of their own and several agent sessions use it, they 
 | `$NV lua 'CODE'` | Run Lua. A returned string prints raw; anything else prints as JSON. |
 | `$NV lua -f file.lua` | Same, from a file (use for anything multi-line or quote-heavy). |
 | `$NV lines [A [B]]` | Numbered buffer lines A..B (default: whole buffer). |
+| `$NV buf read\|edit\|save PATH …` | Safely read and edit a file the user has open, by buffer. See "Editing a file the user has open". |
 | `$NV escape` | Back to normal mode from anything: pending keys, insert, visual, cmdline, hit-enter prompt, terminal. Works even when Neovim is waiting for input. Prints the resulting mode. |
 | `$NV list` | All the user's Neovims and managed servers, with status. |
 | `$NV start` / `stop` / `attach` | Managed server: start explicitly, stop, or print the command the user runs to watch it. If the user also has their own Neovim open, other commands still go to *theirs* unless you pass `-s <managed socket>`. |
@@ -81,55 +82,39 @@ Where Neovim wins:
 - **Structural edits in one command**: `:g/pat/normal A;`, `:g/pat/d`, `:'<,'>sort u`, `:%!jq .`, `=` to re-indent, text objects. Each replaces many individual edits.
 - **Large files**: jump to and change one spot without reading the whole file into context.
 - **Multi-file edits with review**: `:vimgrep /pat/ **/*.ts`, then `:cfdo %s/old/new/ge | update`.
-- **Undo**: every `nv lua` or `nv cmd` call is **one undo step**, even with several edits inside it. `nv cmd undo` takes back your last change precisely; `:earlier 2m` rolls back further. The user can attach (or look at their editor) and press `u` to step back through your work. On a managed server the history lasts only as long as the server, which quits after `NV_IDLE` idle.
+- **Undo**: every `nv lua` or `nv cmd` call is **one undo step**, even with several edits inside it. (That holds for the current buffer. Consecutive calls that change a buffer *not* shown in the current window merge into one step; `nv buf edit` avoids this.) `nv cmd undo` takes back your last change precisely; `:earlier 2m` rolls back further. The user can attach (or look at their editor) and press `u` to step back through your work. On a managed server the history lasts only as long as the server, which quits after `NV_IDLE` idle.
 
 Your own file tools are still better for small targeted edits and new files. `sed`/`perl` match `:s` for plain regex replacements.
 
-**Editing a file the user has open**: check with `$NV expr 'bufloaded("/abs/path")'` (symlinked paths match too). Edit that buffer by number rather than with `:edit`, which would switch the user's window.
+**Editing a file the user has open**: use `$NV buf`. It edits the buffer by number, so the user's window doesn't switch, and it runs the checks below for you. `buf read` on a file that isn't open exits 3: use your own tools.
 
-The buffer can differ from the file on disk, so don't take line numbers from a disk read. First run `checktime` on the buffer, then read the lines from the buffer itself:
-```lua
-local buf = vim.fn.bufnr("/abs/path")
-vim.v.warningmsg = ""
-vim.api.nvim_buf_call(buf, function() vim.cmd("checktime") end)
-return {
-  warning = vim.v.warningmsg,          -- non-empty: stop (see below)
-  modified = vim.bo[buf].modified,     -- the user has unsaved changes
-  tick = vim.b[buf].changedtick,       -- pass to the edit call
-  lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false),  -- or a range around the target
-}
+```sh
+$NV buf read /abs/path [A [B]]       # checktime, then a header and numbered lines A..B
+$NV buf edit /abs/path TICK A B [--save] <<'EOF'
+replacement lines
+EOF
 ```
-`checktime` reloads the buffer if the file changed on disk and it has no unsaved changes (with 'autoread' on, the default). Anything else leaves a `warning`: W11 changed on disk but not reloaded ('autoread' off), W12 changed on disk *and* in the buffer, W13 created since it was opened, W16 permissions changed, E211 deleted. On any warning, change nothing: stop and tell the user what it says.
+- `buf read` prints `ok buf=N tick=T modified=true|false lines=L`, then the lines. Take line numbers from this, not from the file on disk: the buffer can differ from it.
+- `buf edit` replaces lines A..B (1-based, inclusive) with stdin; `B = A-1` inserts before line A, and `--delete` (no stdin) deletes. It first re-runs `checktime` and checks the buffer is unchanged since the read at `TICK`. Its output includes the new tick, for the next edit. Each call is one undo step.
+- Pass the new lines with a heredoc, as above, not through a pipe. That keeps it a single `nv` command.
 
-If `modified` is true, the user has unsaved work in that buffer. Do what they've asked for (in their instructions or the request), and if they haven't said, use option 2:
+Exit status tells you what to do:
+
+| Exit | Meaning | Do |
+|---|---|---|
+| 0 | Done | Carry on |
+| 3 | Not open in Neovim | Use your own tools |
+| 4 | Stop: a `checktime` warning (W11 changed on disk but not reloaded, W12 changed on disk *and* in the buffer, W13 created, W16 permissions changed, E211 deleted), a stale buffer, or `--save` with unsaved changes | Change nothing more. Tell the user what it says |
+| 5 | The buffer changed since your read: the user typed or the file reloaded | Re-read and try once more; if it happens again, stop and tell the user |
+
+**If the header says `modified=true`**, the user has unsaved work in that buffer. Do what they've asked for (in their instructions or the request), and if they haven't said, use option 2:
 1. **Don't edit.** Stop and tell them to save or discard their changes before you can continue.
-2. **Edit, don't save** (default). Make the edit with `save = false`. Your change is then only in the buffer, so tests, builds and anything else that reads the file won't see it. Stop and tell them to save the file before you can continue.
-3. **Save, edit, save.** First write the buffer in its own call (`silent write` in `nvim_buf_call`), so their work is saved as they left it. Then re-read and edit as for an unmodified buffer.
+2. **Edit, don't save** (default). Use `buf edit` without `--save`. Your change is then only in the buffer, so tests, builds and anything else that reads the file won't see it. Stop and tell them to save the file before you can continue.
+3. **Save, edit, save.** `$NV buf save /abs/path TICK` saves their work as they left it; then re-read and edit with `--save`.
 
-Never pick a more forceful option than the user asked for, and never save their unsaved work unless they chose option 3.
+Never pick a more forceful option than the user asked for, and never save their unsaved work unless they chose option 3. (`buf edit --save` refuses a buffer with unsaved changes, so you can't do it by accident.)
 
-Then edit, in a separate call. It re-checks first and changes nothing if the buffer moved on since the read:
-```lua
-local buf, tick, save = vim.fn.bufnr("/abs/path"), 42, true  -- tick from the read; save = false for option 2
-vim.v.warningmsg = ""
-vim.api.nvim_buf_call(buf, function() vim.cmd("checktime") end)
-if vim.v.warningmsg ~= "" or vim.b[buf].changedtick ~= tick then
-  return "changed since read: " .. vim.v.warningmsg
-end
-local autoread = vim.api.nvim_get_option_value("autoread", { buf = buf })
-if autoread == nil then autoread = vim.go.autoread end
-if save and not autoread and not vim.deep_equal(vim.api.nvim_buf_get_lines(buf, 0, -1, false),
-    vim.fn.readfile(vim.api.nvim_buf_get_name(buf))) then
-  return "stale: the buffer differs from the file on disk"
-end
-vim.api.nvim_buf_set_lines(buf, 9, 12, false, {"new a", "new b"})
-if save then vim.api.nvim_buf_call(buf, function() vim.cmd("silent write") end) end
-return "ok"
-```
-- **Changed since read:** the user typed in the buffer or the file was reloaded, so your line numbers may be wrong. Re-read and try once more; if it changes again, stop and tell the user.
-- **Stale:** with 'autoread' off, `checktime` warns only once, so an earlier warning (when the user switched back to Neovim, say) would hide it. Comparing with the file catches that. A difference in line endings or encoding can also trigger it; either way, stop and tell the user.
-
-A `write` can still hit a prompt, for example if the file changes between the check and the write. Neovim asks "file has been changed since reading it … (y/n)?", `silent` doesn't suppress it, and `nv` times out, reporting what Neovim is waiting for and whose editor it is. Only answer a prompt you caused and understand:
+**Prompts:** a save can still hit Neovim's "file has been changed since reading it … (y/n)?" prompt, for example if the file changes between the check and the write. `nv` times out and reports what Neovim is waiting for and whose editor it is. Only answer a prompt you caused and understand:
 - **A managed server nobody is attached to:** answer this write prompt with `$NV send n`. That declines, so nothing is written. Then stop and work out why the file changed.
 - **The user's own Neovim, or a managed server they're attached to:** leave the prompt. Stop and tell the user their Neovim is asking whether to overwrite a file that changed on disk. It's their decision.
 

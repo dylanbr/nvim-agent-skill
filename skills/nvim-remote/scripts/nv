@@ -22,6 +22,13 @@
 #   lua CODE          Run Lua; print the returned value as JSON (strings raw)
 #   lua -f FILE       Run a Lua file; same output
 #   lines [A [B]]     Print buffer lines A..B (1-based, default whole buffer) with numbers
+#   buf read PATH [A [B]]
+#                     Safely read a buffer the user has open (checktime first); prints
+#                     buf, tick, modified, then numbered lines
+#   buf edit PATH TICK A B [--save] [--delete] < new-lines
+#                     Replace lines A..B (B = A-1 inserts) if the buffer is unchanged
+#                     since the read at TICK; --save writes it (refused with unsaved changes)
+#   buf save PATH TICK   Save the user's unsaved changes (only when they've asked)
 #   escape            Return to normal mode, cancelling pending keys and prompts
 #   start             Start this session's managed server (no-op if running)
 #   stop              Stop this session's managed server (refuses with unsaved changes)
@@ -32,6 +39,8 @@
 #   kill [-9]         Last resort: SIGTERM (or SIGKILL) the Neovim process
 #
 # Exit status is non-zero on any failure, including Lua/Vimscript errors.
+# buf: 3 = not open in Neovim, 4 = stop and tell the user, 5 = changed since
+# the read (re-read and retry).
 
 set -uo pipefail
 
@@ -44,8 +53,9 @@ MANAGED_DIR=${NV_MANAGED_DIR:-${_tmp%/}/nv-$USER}
 SESSION_KEY=""      # set by init_session
 MANAGED_SOCKET=""
 TMPF=""
+TEXTF=""     # new lines for `buf edit`
 LOCK=""
-trap '[ -n "$TMPF" ] && rm -f "$TMPF"; [ -n "$LOCK" ] && rmdir "$LOCK" 2>/dev/null' EXIT
+trap '[ -n "$TMPF" ] && rm -f "$TMPF"; [ -n "$TEXTF" ] && rm -f "$TEXTF"; [ -n "$LOCK" ] && rmdir "$LOCK" 2>/dev/null' EXIT
 export NV_IDLE_LUA="$SCRIPT_DIR/idle.lua"
 
 die() { echo "nv: $*" >&2; exit 1; }
@@ -433,6 +443,50 @@ cmd_cmd() {
   run_lua_source "return vim.fn.execute($(printf '%s' "$*" | lua_quote))"
 }
 
+# Safe edits to a buffer the user has open (buf.lua). Exit status: 0 ok,
+# 3 not open (use your own tools), 4 stop and tell the user, 5 changed since
+# read (re-read and retry), 1 other errors.
+cmd_buf() {
+  local op=${1:-} path=${2:-} call out rc
+  [ -n "$op" ] && [ -n "$path" ] || die "usage: nv buf read|edit|save PATH ..."
+  case $path in /*) ;; *) path="$PWD/$path" ;; esac
+  local int='^-?[0-9]+$' q; q=$(printf '%s' "$path" | lua_quote)
+  shift 2
+  case $op in
+    read)
+      for n in "$@"; do [[ $n =~ $int ]] || die "buf read: line numbers must be integers"; done
+      call="read($q, ${1:-nil}, ${2:-nil})" ;;
+    edit)
+      local save=false delete=false textf=nil
+      [ $# -ge 3 ] && [[ $1 =~ $int ]] && [[ $2 =~ $int ]] && [[ $3 =~ $int ]] ||
+        die "usage: nv buf edit PATH TICK A B [--save] [--delete] < new-lines"
+      local tick=$1 a=$2 b=$3; shift 3
+      for f in "$@"; do
+        case $f in --save) save=true ;; --delete) delete=true ;; *) die "buf edit: unknown option $f" ;; esac
+      done
+      if ! $delete; then
+        [ -t 0 ] && die "buf edit reads the new lines from stdin (or pass --delete)"
+        new_tmpfile; TEXTF=$TMPF; TMPF=""
+        cat > "$TEXTF"
+        [ -s "$TEXTF" ] || { rm -f "$TEXTF"; die "buf edit: no new lines on stdin; to delete lines, pass --delete"; }
+        textf=$(printf '%s' "$TEXTF" | lua_quote)
+      fi
+      call="edit($q, $tick, $a, $b, $textf, $save)" ;;
+    save)
+      [ $# -eq 1 ] && [[ $1 =~ $int ]] || die "usage: nv buf save PATH TICK"
+      call="save($q, $1)" ;;
+    *) die "unknown buf operation: $op (read, edit or save)" ;;
+  esac
+  out=$(run_lua_source "return dofile($(printf '%s' "$SCRIPT_DIR/buf.lua" | lua_quote)).$call"); rc=$?
+  [ -n "$TEXTF" ] && rm -f "$TEXTF"
+  [ $rc -eq 0 ] || exit 1
+  printf '%s\n' "$out"
+  case $out in
+    ok*) rc=0 ;; not-open*) rc=3 ;; stop*) rc=4 ;; changed*) rc=5 ;; *) rc=1 ;;
+  esac
+  exit $rc
+}
+
 cmd_expr() {
   [ $# -ge 1 ] || die "expr needs an expression"
   run_lua_source "return vim.json.encode(vim.fn.eval($(printf '%s' "$*" | lua_quote)))"
@@ -650,5 +704,6 @@ case $sub in
                lua_code "$*" | pretty
              fi ;;
   lines)     resolve_socket; cmd_lines "$@" ;;
+  buf)       resolve_socket; cmd_buf "$@" ;;
   *) die "unknown command: $sub (try nv --help)" ;;
 esac
