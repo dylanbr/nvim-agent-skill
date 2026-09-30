@@ -80,7 +80,7 @@ Where Neovim wins:
 - **LSP edits**: `vim.lsp.buf.rename()`, code actions, `vim.lsp.buf.format()`. They're semantically correct, unlike text replacement, which also hits comments and strings. They need a language server: the user's Neovim, or a managed server started with `NV_USER_CONFIG=1`.
 - **Structural edits in one command**: `:g/pat/normal A;`, `:g/pat/d`, `:'<,'>sort u`, `:%!jq .`, `=` to re-indent, text objects. Each replaces many individual edits.
 - **Large files**: jump to and change one spot without reading the whole file into context.
-- **Multi-file edits with review**: `:vimgrep /pat/ **/*.ts`, then `:cfdo s/old/new/ge | update`.
+- **Multi-file edits with review**: `:vimgrep /pat/ **/*.ts`, then `:cfdo %s/old/new/ge | update`.
 - **Undo**: every `nv lua` or `nv cmd` call is **one undo step**, even with several edits inside it. `nv cmd undo` takes back your last change precisely; `:earlier 2m` rolls back further. The user can attach (or look at their editor) and press `u` to step back through your work. On a managed server the history lasts only as long as the server, which quits after `NV_IDLE` idle.
 
 Your own file tools are still better for small targeted edits and new files. `sed`/`perl` match `:s` for plain regex replacements.

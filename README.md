@@ -74,7 +74,7 @@ By default the agent uses Neovim when you ask it to. Beyond that, the skill is u
 - **LSP edits:** renaming a symbol across the project, code actions, formatting. These are semantically correct, where find-and-replace also hits comments and strings.
 - **Structural edits in one command:** `:g/pattern/normal A;`, `:sort u`, `:%!jq .`, re-indenting.
 - **Large files:** changing one spot without reading the whole file.
-- **Multi-file edits:** `:vimgrep` into the quickfix list, then `:cfdo s/old/new/ge | update`.
+- **Multi-file edits:** `:vimgrep` into the quickfix list, then `:cfdo %s/old/new/ge | update`.
 
 The skill tells the agent about both. Small edits and new files still go through the agent's normal tools, which are faster for those.
 
