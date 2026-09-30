@@ -104,7 +104,7 @@ Exit status tells you what to do:
 |---|---|---|
 | 0 | Done | Carry on |
 | 3 | Not open in Neovim | Use your own tools |
-| 4 | Stop: a `checktime` warning (W11 changed on disk but not reloaded, W12 changed on disk *and* in the buffer, W13 created, W16 permissions changed, E211 deleted), a stale buffer, or `--save` with unsaved changes | Change nothing more. Tell the user what it says |
+| 4 | Stop: a `checktime` warning (W11 changed on disk but not reloaded, W12 changed on disk *and* in the buffer, W13 created, W16 permissions changed, E211 deleted), a stale buffer, `--save` with unsaved changes, or lines outside the buffer | Change nothing more. Tell the user what it says |
 | 5 | The buffer changed since your read: the user typed or the file reloaded | Re-read and try once more; if it happens again, stop and tell the user |
 
 **If the header says `modified=true`**, the user has unsaved work in that buffer. Do what they've asked for (in their instructions or the request), and if they haven't said, use option 2:
@@ -142,7 +142,7 @@ Never answer `y`, and never `escape` or `interrupt` a prompt in the user's edito
 
 ## Troubleshooting a stuck Neovim
 
-**How to tell it's stuck:** a command fails with "timed out … stuck or waiting for input", or `nv` reports a Neovim that "isn't responding".
+**How to tell it's stuck:** a command fails with "timed out … stuck or waiting for input" or "timed out … is waiting for <a prompt>", or `nv` reports a Neovim that "isn't responding".
 
 **Step 1: diagnose.** Run `$NV -s SOCKET doctor`; the socket is in the error message. It works without Neovim's cooperation. It reports the process state, CPU usage, child processes (flagging only those started *after* Neovim, since plugins and LSP servers start with it), and whether Neovim answers a fast mode query. Then it prints a **verdict** and a **fix**.
 
@@ -167,13 +167,13 @@ Re-run `doctor` after each fix until it says `healthy`.
 
 **Never** send SIGINT (`kill -INT`) to Neovim. It terminates a headless instance instead of interrupting it. `nv interrupt` delivers CTRL-C as input, which is the safe way.
 
-**Avoid causing hangs:** don't leave key sequences unfinished. Don't run `:!` commands that wait for input or run indefinitely (run those in your own shell instead). Don't send Lua with unbounded loops. Prefer `cmd`/`lua` over keystrokes that might open prompts.
+**Avoid causing hangs:** besides the keystroke gotchas above, don't run `:!` commands that wait for input or run indefinitely (run those in your own shell instead), and don't send Lua with unbounded loops.
 
 ## Etiquette and safety
 
 - It's the user's live editor. Don't `:q`, `:qa!`, `:bd!` or discard unsaved changes (`modified: true`) unless they asked for it. Ask before `:w` unless saving is clearly part of the request.
 - The user may be typing at the same time. If state changes unexpectedly between calls, assume they did it, re-read the state, and don't fight them.
-- Keep changes undoable. Normal edits are, and the user can press `u`. Group each logical change into one `lua`/`cmd` call so it's one undo step, and mention `u` for big changes.
+- Keep changes undoable (see Undo, above), and mention `u` for big changes.
 - Anyone with access to a socket gets full control of that Neovim, including shell commands via `:!`. Remind the user if they choose a `--listen` path in a shared or world-readable location.
 - Socket paths must be under ~104 characters on macOS; longer paths fail with "connection refused".
 

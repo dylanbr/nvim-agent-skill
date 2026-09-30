@@ -2,7 +2,7 @@
 # Tests for nv against a headless Neovim that this script starts and stops.
 # It never touches your own editor: every call passes the test server's socket.
 #
-# Usage: tests/run.sh    (needs nvim, perl, lsof, python3; ~20s, mostly
+# Usage: tests/run.sh    (needs nvim, perl, lsof, python3; about 10-15s, mostly
 # waiting for file timestamps to change)
 
 set -uo pipefail
@@ -14,12 +14,12 @@ unset NV_USER_CONFIG NVIM_SOCKET
 
 DIR=$(mktemp -d "${TMPDIR:-/tmp}/nvtest.XXXXXX")
 DIR=$(cd "$DIR" && pwd -P)
-SOCK=""
+SOCK="" UI_PID=""
 PASS=0 FAIL=0
 
 cleanup() {
   [ -n "$SOCK" ] && "$NV_BIN" -s "$SOCK" kill -9 >/dev/null 2>&1
-  [ -n "${UI_PID:-}" ] && kill "$UI_PID" 2>/dev/null
+  [ -n "$UI_PID" ] && kill "$UI_PID" 2>/dev/null
   rm -rf "$DIR"
 }
 trap cleanup EXIT
@@ -36,8 +36,13 @@ expect_rc() { [ "$RC" -eq "$1" ] && ok "$2" || bad "$2 (exit $RC, wanted $1)" "$
 expect_out() { case $OUT in *"$1"*) ok "$2" ;; *) bad "$2 (output lacks: $1)" "$OUT" ;; esac; }
 expect_eq() { [ "$1" = "$2" ] && ok "$3" || bad "$3" "got:    $(printf '%q' "$1")"$'\n'"wanted: $(printf '%q' "$2")"; }
 
+# Create files containing l1, l2, l3.
+mkfile() { local f; for f in "$@"; do printf 'l1\nl2\nl3\n' > "$DIR/$f"; done; }
+# A file's contents on disk, or its buffer's, with | for each line end.
 file() { tr '\n' '|' < "$DIR/$1"; }
 bufl() { nv lua "return table.concat(vim.api.nvim_buf_get_lines(vim.fn.bufnr('$DIR/$1'), 0, -1, false), '|') .. '|'"; }
+# Change FILE's buffer as if the user typed: replace line N with TEXT.
+user_types() { nv lua "vim.api.nvim_buf_set_lines(vim.fn.bufnr('$DIR/$1'), $2 - 1, $2, false, {'$3'})" >/dev/null; }
 tick() { printf '%s\n' "$OUT" | sed -n '1s/.* tick=\([0-9]*\).*/\1/p'; }
 # Open files in the background, leaving an empty buffer in the window.
 open() { local f; for f in "$@"; do nv cmd "edit $DIR/$f" >/dev/null; done; nv cmd enew >/dev/null; }
@@ -50,7 +55,7 @@ SOCK=$("$NV_BIN" attach | awk '{print $3}')
 nv cmd 'set noswapfile' >/dev/null
 
 echo "buf read"
-printf 'l1\nl2\nl3\n' > "$DIR/a.txt"
+mkfile a.txt
 open a.txt
 run nv buf read "$DIR/nope.txt"; expect_rc 3 "file not open: exit 3"
 run nv buf read "$DIR/a.txt"; expect_rc 0 "open file: exit 0"
@@ -79,19 +84,18 @@ nv lua "vim.api.nvim_buf_call(vim.fn.bufnr('$DIR/a.txt'), function() vim.cmd('un
 expect_eq "$(bufl a.txt)" "l1|AGENT|l3|" "one undo reverts one edit"
 
 echo "changes between read and edit"
-printf 'l1\nl2\nl3\n' > "$DIR/b.txt"
+mkfile b.txt
 open b.txt
 run nv buf read "$DIR/b.txt"; t=$(tick)
-nv lua "vim.api.nvim_buf_set_lines(vim.fn.bufnr('$DIR/b.txt'), 0, 1, false, {'TYPED'})" >/dev/null
+user_types b.txt 1 TYPED
 run nv buf edit "$DIR/b.txt" "$t" 2 2 <<< "AGENT"; expect_rc 5 "user typed since read: exit 5"
 expect_eq "$(bufl b.txt)" "TYPED|l2|l3|" "nothing edited"
 
 echo "file changed on disk"
-printf 'l1\nl2\nl3\n' > "$DIR/c.txt"; printf 'l1\nl2\nl3\n' > "$DIR/d.txt"
-printf 'l1\nl2\nl3\n' > "$DIR/e.txt"; printf 'l1\nl2\nl3\n' > "$DIR/f.txt"
+mkfile c.txt d.txt e.txt f.txt
 open c.txt d.txt e.txt f.txt
 nv lua "vim.bo[vim.fn.bufnr('$DIR/d.txt')].autoread = false" >/dev/null
-nv lua "vim.api.nvim_buf_set_lines(vim.fn.bufnr('$DIR/e.txt'), 2, 3, false, {'USER'})" >/dev/null
+user_types e.txt 3 USER
 later
 printf 'DISK\nl2\nl3\n' > "$DIR/c.txt"; printf 'DISK\nl2\nl3\n' > "$DIR/d.txt"; printf 'DISK\nl2\nl3\n' > "$DIR/e.txt"
 rm "$DIR/f.txt"
@@ -104,9 +108,9 @@ run nv buf read "$DIR/e.txt"; expect_rc 4 "changed on disk and in buffer: stop";
 run nv buf read "$DIR/f.txt"; expect_rc 4 "deleted: stop"; expect_out "E211" "E211 reported"
 
 echo "unsaved changes"
-printf 'l1\nl2\nl3\n' > "$DIR/g.txt"
+mkfile g.txt
 open g.txt
-nv lua "vim.api.nvim_buf_set_lines(vim.fn.bufnr('$DIR/g.txt'), 2, 3, false, {'USER'})" >/dev/null
+user_types g.txt 3 USER
 run nv buf read "$DIR/g.txt"; expect_out "modified=true" "reported as modified"; t=$(tick)
 run nv buf edit "$DIR/g.txt" "$t" 2 2 --save <<< "AGENT"; expect_rc 4 "--save refused"
 run nv buf edit "$DIR/g.txt" "$t" 2 2 <<< "AGENT"; expect_rc 0 "option 2: edit without saving"
@@ -117,16 +121,16 @@ run nv buf save "$DIR/g.txt" "$t"; expect_rc 0 "option 3: save first"
 expect_eq "$(file g.txt)" "l1|AGENT|USER|" "option 3: user's work saved"
 
 echo "prompts"
-printf 'l1\nl2\nl3\n' > "$DIR/h.txt"
+mkfile h.txt
 open h.txt
-nv lua "vim.api.nvim_buf_set_lines(vim.fn.bufnr('$DIR/h.txt'), 2, 3, false, {'USER'})" >/dev/null
+user_types h.txt 3 USER
 later; printf 'DISK\nl2\nl3\n' > "$DIR/h.txt"
 run nv buf read "$DIR/h.txt"; expect_rc 4 "W12 on first check"
 run nv buf read "$DIR/h.txt"; expect_rc 0 "W12 is given only once"; t=$(tick)
 run nv -t 2 buf save "$DIR/h.txt" "$t"; expect_rc 1 "write hangs at a prompt: times out"
 expect_out "yes/no confirm prompt" "timeout names the prompt"
 expect_out "nobody attached" "timeout says whose editor"
-run "$NV_BIN" -s "$SOCK" doctor; expect_out "WAITING AT A PROMPT" "doctor verdict"
+run nv doctor; expect_out "WAITING AT A PROMPT" "doctor verdict"
 if command -v script >/dev/null; then
   if script -q /dev/null true 2>/dev/null; then
     script -q /dev/null nvim --server "$SOCK" --remote-ui < /dev/null > /dev/null 2>&1 &
@@ -134,7 +138,7 @@ if command -v script >/dev/null; then
     script -qc "nvim --server '$SOCK' --remote-ui" /dev/null < /dev/null > /dev/null 2>&1 &
   fi
   UI_PID=$!; sleep 1
-  run "$NV_BIN" -s "$SOCK" doctor; expect_out "with the user attached" "doctor sees an attached UI"
+  run nv doctor; expect_out "with the user attached" "doctor sees an attached UI"
   kill "$UI_PID" 2>/dev/null; wait "$UI_PID" 2>/dev/null; UI_PID=""
 else
   echo "  skip  attached UI (no script command)"

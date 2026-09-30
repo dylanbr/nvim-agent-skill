@@ -100,10 +100,10 @@ To have the agent route edits through your editor whenever it's open, add someth
 
 ```markdown
 When my Neovim is running (`nv list` shows it), make code edits through it with the
-nvim-remote skill so I can watch and undo them: one `nv lua`/`nv cmd` call per
-logical change, using the vim.api functions rather than keystrokes, then `:write`
-(undo still works after saving). Use your normal tools for new files and bulk
-generated changes.
+nvim-remote skill so I can watch and undo them: `nv buf` for files I already
+have open, otherwise one `nv lua`/`nv cmd` call per logical change, using the
+vim.api functions rather than keystrokes, then `:write` (undo still works after
+saving). Use your normal tools for new files and bulk generated changes.
 ```
 
 A middle option: route edits through Neovim only for files you already have open:
@@ -141,6 +141,7 @@ Each agent session gets its own managed server, named `<agent>-<id>` (for exampl
 1. `$NV_SESSION`, if set; this replaces the whole name
 2. Claude Code's session ID
 3. a random ID remembered for the calling agent process
+4. one per directory, if the agent process can't be found
 
 All sessions share your own Neovim, since one editor can't be split between them. `nv` warns when another session has used it recently.
 
@@ -153,6 +154,7 @@ All sessions share your own Neovim, since one editor can't be split between them
 | `NV_TIMEOUT` | `5` | Per-call RPC timeout in seconds (also `-t`) |
 | `NVIM_SOCKET` | unset | Socket to use (also `-s`) |
 | `NV_SESSION` | detected | Session ID override |
+| `NV_MANAGED_DIR` | `$TMPDIR/nv-$USER` | Directory for managed server sockets; must be a directory you own (set to mode 700) |
 
 ## Security
 
@@ -160,9 +162,15 @@ Anyone who can connect to a Neovim socket has full control of that Neovim, inclu
 
 ## Development
 
-`tests/run.sh` starts its own headless Neovim and checks `nv`'s safe-edit commands and prompt handling against it (about 15 seconds). It never touches your running editor.
+[AGENTS.md](AGENTS.md) describes the architecture and design rules for anyone, human or agent, working on the code.
 
-Bump `version` in `.claude-plugin/plugin.json` for each release: Claude Code only updates an installed plugin when that changes.
+`tests/run.sh` starts its own headless Neovim and checks `nv`'s safe-edit commands and prompt handling against it (about 10–15 seconds). It never touches your running editor.
+
+Bump `version` in `.claude-plugin/plugin.json` for each release: Claude Code only updates an installed plugin when that changes. Versions are `MAJOR.MINOR.PATCH`:
+
+- **PATCH** for bug fixes, and for clean-ups and documentation changes that don't change behaviour
+- **MINOR** for new features or changes in behaviour
+- **MAJOR** for big changes, especially ones that break how the skill is used (commands, options or exit codes)
 
 ## License
 

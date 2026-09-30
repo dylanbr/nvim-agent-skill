@@ -24,12 +24,19 @@ local function header(buf)
     buf, vim.b[buf].changedtick, tostring(vim.bo[buf].modified), api.nvim_buf_line_count(buf))
 end
 
--- Re-check a buffer before changing it: nil if it's safe, else the status text.
-local function recheck(path, tick)
+-- Find PATH's buffer and run checktime on it: the buffer, or nil and the status text.
+local function open(path)
   local buf = find(path)
   if not buf then return nil, 'not-open ' .. path end
   local warning = checktime(buf)
   if warning ~= '' then return nil, 'stop ' .. warning end
+  return buf
+end
+
+-- Re-check a buffer before changing it: as open(), and also unchanged since TICK.
+local function recheck(path, tick)
+  local buf, err = open(path)
+  if not buf then return nil, err end
   if vim.b[buf].changedtick ~= tick then
     return nil, 'changed the buffer changed since it was read (now ' .. header(buf) .. '); re-read it'
   end
@@ -53,10 +60,8 @@ end
 
 -- Lines A..B (1-based, inclusive; default whole buffer), numbered, after a header.
 function M.read(path, a, b)
-  local buf = find(path)
-  if not buf then return 'not-open ' .. path end
-  local warning = checktime(buf)
-  if warning ~= '' then return 'stop ' .. warning end
+  local buf, err = open(path)
+  if not buf then return err end
   local n = api.nvim_buf_line_count(buf)
   a = math.max(a or 1, 1)
   b = math.min(b or n, n)

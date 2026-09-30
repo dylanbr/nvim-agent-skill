@@ -1,7 +1,7 @@
 {
   "name": "nvim-agent-skill",
   "description": "Drive Neovim live over its RPC socket: your running editor or a managed headless one. Send keys, run Ex commands, evaluate Lua, read editor state, and diagnose a stuck editor.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": {
     "name": "Dylan Bridgman"
   },
