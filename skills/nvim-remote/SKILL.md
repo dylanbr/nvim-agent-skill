@@ -1,6 +1,18 @@
 ---
 name: nvim-remote
-description: Drive Neovim live over its RPC socket — the user's running editor, or a managed headless one started on demand — to send keystrokes, run Ex commands, evaluate Vimscript/Lua, and read editor state (mode, cursor, visible lines, windows, diagnostics). Use when the user asks you to drive, control, pair in, or do something "in/with/using nvim/neovim/vim" or this skill, or to connect to a Neovim socket. Also use when an edit is quicker or safer in Neovim: LSP rename/code actions/formatting, :g/:normal/:sort-style structural edits, targeted edits in large files, or changes the user may want to review and undo step by step. Not for small edits or new files, which your own tools do in one step.
+description: >-
+  Drive Neovim live over its RPC socket — the user's running editor, or a
+  managed headless one started on demand — to send keystrokes, run Ex commands,
+  evaluate Vimscript/Lua, and read editor state (mode, cursor, visible lines,
+  windows, diagnostics). Use when the user asks you to drive, control, pair in,
+  or do something "in/with/using nvim/neovim/vim" or this skill, or to connect
+  to a Neovim socket. Also use when an edit is quicker or safer in Neovim: LSP
+  rename/code actions/formatting, :g/:normal/:sort-style structural edits,
+  targeted edits in large files, or changes the user may want to review and
+  undo step by step. Not for small edits or new files, which your own tools do
+  in one step.
+license: MIT
+compatibility: Requires Neovim 0.10+, bash, perl, lsof; python3 strongly recommended; jq optional
 ---
 
 # nvim-remote
