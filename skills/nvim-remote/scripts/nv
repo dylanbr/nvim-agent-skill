@@ -16,7 +16,9 @@
 # Usage: nv [-s SOCKET] [-t SECONDS] <command> [args]
 #   list              List the user's live Neovims and all managed servers
 #   state             JSON snapshot: mode, file, cursor, visible lines, windows
-#   send KEYS         Type keys as if at the keyboard (<Esc>, <CR>, <C-w> etc.)
+#   send KEYS         Type keys as if at the keyboard (<Esc>, <CR>, <C-w> etc.).
+#                     Refuses at a yes/no confirm prompt, except `send n` on a
+#                     managed server with nobody attached (decline only; never y)
 #   cmd EXCMD         Run an Ex command, print its output (e.g. nv cmd 'ls')
 #   expr EXPR         Evaluate a Vimscript expression, print result as JSON
 #   lua CODE          Run Lua; print the returned value as JSON (strings raw)
@@ -30,12 +32,13 @@
 #                     since the read at TICK; --save writes it (refused with unsaved changes)
 #   buf save PATH TICK   Save the user's unsaved changes (only when they've asked)
 #   escape            Return to normal mode, cancelling pending keys and prompts
+#                     (refuses at a yes/no confirm: that would answer it)
 #   start             Start this session's managed server (no-op if running)
 #   stop              Stop this session's managed server (refuses with unsaved changes)
 #   attach            Print the command the user runs to watch the server live
 #   doctor            Diagnose an unresponsive Neovim and suggest a fix
 #   interrupt         Send CTRL-C (cancels :! commands, Vimscript loops, pending input;
-#                     cannot stop a pure-Lua infinite loop)
+#                     cannot stop a pure-Lua infinite loop; refuses at a yes/no confirm)
 #   kill [-9]         Last resort: SIGTERM (or SIGKILL) the Neovim process
 #
 # Exit status is non-zero on any failure, including Lua/Vimscript errors.
@@ -326,6 +329,20 @@ socket_owner() {
   fi
 }
 
+# True when Neovim is at a yes/no confirm (mode r?), e.g. overwrite-on-disk.
+# Needs the fast rpc_mode query (python3); if that fails, returns false.
+at_confirm() {
+  local m
+  m=$(rpc_mode "$SOCKET" 1) || return 1
+  [ "$(mode_name "$m")" = 'r?' ]
+}
+
+# escape/interrupt must not answer a confirm prompt (Esc/CTRL-C would).
+refuse_if_confirm() {
+  at_confirm || return 0
+  die "refusing to $1 — Neovim ($(socket_owner)) is at a yes/no confirm prompt. Leave it for the user, or decline only with: nv -s $SOCKET send n (managed server, nobody attached). Details: nv -s $SOCKET doctor"
+}
+
 rexpr() {
   local out rc m kind
   out=$(remote_expr "$SOCKET" "$TIMEOUT" "$1" 2>&1); rc=$?
@@ -453,7 +470,21 @@ LUA
 
 cmd_send() {
   [ $# -ge 1 ] || die "send needs KEYS"
-  with_timeout nvim --server "$SOCKET" --remote-send "$*" || die "send failed"
+  local keys=$* m owner
+  # A confirm prompt reads the next key as y/n. Yank (yy) and similar would
+  # answer "yes" and overwrite the file. Only declining with n/N is allowed,
+  # and only on a managed server with nobody attached (see Design rules).
+  if m=$(rpc_mode "$SOCKET" 1) && [ "$(mode_name "$m")" = 'r?' ]; then
+    owner=$(socket_owner)
+    case $keys in
+      n|N)
+        [ "$owner" = "a managed server with nobody attached" ] ||
+          die "refusing to answer a confirm prompt in $owner — leave it for the user. Details: nv -s $SOCKET doctor" ;;
+      *)
+        die "refusing to send keys at a yes/no confirm prompt ($owner): $m. A key like y would overwrite the file. To decline on a managed server with nobody attached: nv -s $SOCKET send n. Otherwise stop and tell the user. Details: nv -s $SOCKET doctor" ;;
+    esac
+  fi
+  with_timeout nvim --server "$SOCKET" --remote-send "$keys" || die "send failed"
 }
 
 cmd_cmd() {
@@ -527,7 +558,9 @@ cmd_escape() {
   # the cmdline and hit-enter prompts. Then <C-\><C-n> only if still needed
   # (terminal mode). Sending <C-\><C-n> first would be wrong: after a pending
   # `z` it is read as `z<C-\>` followed by <C-n> (cursor down).
+  # Not for yes/no confirms: Esc answers them; refuse_if_confirm stops that.
   local m
+  refuse_if_confirm escape
   cmd_send '<Esc>'
   sleep 0.1
   m=$(rpc_mode "$SOCKET" 1) || m=""
@@ -598,8 +631,13 @@ cmd_doctor() {
     case $(mode_name "$m") in
       r*|c*)
         echo "verdict:  WAITING AT A PROMPT — $(prompt_kind "$m"), in $(socket_owner)."
-        echo "fix:      answer it only if you caused it and know what it asks (nv -s $SOCKET send KEYS)."
-        echo "          Otherwise stop and tell the user; don't escape or interrupt their prompt."
+        if [ "$(mode_name "$m")" = 'r?' ]; then
+          echo "fix:      leave it for the user. To decline only on a managed server with nobody"
+          echo "          attached: nv -s $SOCKET send n. send/escape/interrupt refuse anything else."
+        else
+          echo "fix:      answer it only if you caused it and know what it asks (nv -s $SOCKET send KEYS)."
+          echo "          Otherwise stop and tell the user; don't escape or interrupt their prompt."
+        fi
         return ;;
     esac
     if is_blocking "$m"; then
@@ -646,6 +684,7 @@ cmd_doctor() {
 cmd_interrupt() {
   # Sent as input (nvim_input): Neovim reads it while running :! commands and
   # Vimscript loops. NOT SIGINT — that terminates a headless Neovim.
+  refuse_if_confirm interrupt
   with_timeout nvim --server "$SOCKET" --remote-send '<C-c>' 2>/dev/null ||
     die "could not deliver CTRL-C — Neovim isn't reading input at all (likely a pure-Lua infinite loop). Only 'nv -s $SOCKET kill -9' stops it."
   sleep 0.3

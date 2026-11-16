@@ -63,14 +63,14 @@ If the user has one Neovim of their own and several agent sessions use it, they 
 | Command | What it does |
 |---|---|
 | `$NV state` | JSON snapshot: mode (+ `blocking`), file, filetype, modified, cursor, **visible lines numbered with `>` marking the cursor line**, windows (incl. floating), tab, diagnostic counts, `ui_attached`, last message. **This is your "eyes".** |
-| `$NV send 'KEYS'` | Type keys as a human would, in Vim key notation (`<Esc>`, `<CR>`, `<C-w>`). **`<leader>` is NOT expanded**: it's typed literally and leaves Neovim waiting for more keys. Look up the real key with `$NV expr 'get(g:, "mapleader", "\\")'`. |
+| `$NV send 'KEYS'` | Type keys as a human would, in Vim key notation (`<Esc>`, `<CR>`, `<C-w>`). **`<leader>` is NOT expanded**: it's typed literally and leaves Neovim waiting for more keys. Look up the real key with `$NV expr 'get(g:, "mapleader", "\\")'`. Refuses at a yes/no confirm prompt (see Prompts). |
 | `$NV cmd 'EXCMD'` | Run an Ex command and print its output (`ls`, `messages`, `map ,f`). Doesn't disturb the mode or cmdline. |
 | `$NV expr 'EXPR'` | Evaluate Vimscript; result as JSON. |
 | `$NV lua 'CODE'` | Run Lua. A returned string prints raw; anything else prints as JSON. |
 | `$NV lua -f file.lua` | Same, from a file (use for anything multi-line or quote-heavy). |
 | `$NV lines [A [B]]` | Numbered buffer lines A..B (default: whole buffer). |
 | `$NV buf read\|edit\|save PATH …` | Safely read and edit a file the user has open, by buffer. See "Editing a file the user has open". |
-| `$NV escape` | Back to normal mode from anything: pending keys, insert, visual, cmdline, hit-enter prompt, terminal. Works even when Neovim is waiting for input. Prints the resulting mode. |
+| `$NV escape` | Back to normal mode from pending keys, insert, visual, cmdline, hit-enter prompt, terminal. Works even when Neovim is waiting for input. Prints the resulting mode. Refuses at a yes/no confirm (that would answer it). |
 | `$NV list` | All the user's Neovims and managed servers, with status. |
 | `$NV start` / `stop` / `attach` | Managed server: start explicitly, stop, or print the command the user runs to watch it. If the user also has their own Neovim open, other commands still go to *theirs* unless you pass `-s <managed socket>`. |
 | `$NV doctor` | Diagnose an unresponsive Neovim. See Troubleshooting. |
@@ -126,11 +126,9 @@ Exit status tells you what to do:
 
 Never pick a more forceful option than the user asked for, and never save their unsaved work unless they chose option 3. (`buf edit --save` refuses a buffer with unsaved changes, so you can't do it by accident.)
 
-**Prompts:** a save can still hit Neovim's "file has been changed since reading it … (y/n)?" prompt, for example if the file changes between the check and the write. `nv` times out and reports what Neovim is waiting for and whose editor it is. Only answer a prompt you caused and understand:
-- **A managed server nobody is attached to:** answer this write prompt with `$NV send n`. That declines, so nothing is written. Then stop and work out why the file changed.
-- **The user's own Neovim, or a managed server they're attached to:** leave the prompt. Stop and tell the user their Neovim is asking whether to overwrite a file that changed on disk. It's their decision.
-
-Never answer `y`, and never `escape` or `interrupt` a prompt in the user's editor.
+**Prompts:** a save can still hit Neovim's "file has been changed since reading it … (y/n)?" prompt, for example if the file changes between the check and the write. `nv` times out and reports what Neovim is waiting for and whose editor it is. `send`, `escape` and `interrupt` refuse to act at that confirm — a key like `y` (or yank `yy`) would overwrite the file. The only exception `nv` allows:
+- **A managed server nobody is attached to:** `$NV send n` declines, so nothing is written. Then stop and work out why the file changed.
+- **The user's own Neovim, or a managed server they're attached to:** leave the prompt. Stop and tell the user. `send n` is refused too.
 
 **Edited a file outside Neovim** (with your own tools) that the user has open? Run `nv cmd checktime`. Unmodified buffers reload, and the reload is itself undoable (files up to `'undoreload'`, 10000 lines by default), so the user can still press `u` to see or revert your change.
 
@@ -163,7 +161,7 @@ Never answer `y`, and never `escape` or `interrupt` a prompt in the user's edito
 | Verdict | What doctor sees | Fix |
 |---|---|---|
 | **Waiting for input**: unfinished key sequence, `getchar()` | Fast query answers with `blocking: true`; everything else times out | `$NV escape` (safe: doesn't move the cursor) |
-| **Waiting at a prompt**: confirm (`r?`), hit-enter (`r`), `-- More --` (`rm`), `input()` (`c`) | Mode starts with `r` or `c`; doctor says whose editor it is | Answer only a prompt you caused and understand. Otherwise, or in the user's editor, leave it and tell the user. |
+| **Waiting at a prompt**: confirm (`r?`), hit-enter (`r`), `-- More --` (`rm`), `input()` (`c`) | Mode starts with `r` or `c`; doctor says whose editor it is | Confirm (`r?`): leave it (or `$NV send n` on an unattended managed server). Hit-enter / More: `$NV escape` if you caused it. Otherwise tell the user. |
 | **Waiting on a child process**: `:!cmd`, `system()` | No answer, ~0% CPU, a shell child (`sh -c …`) or other recently started child. A non-shell child may just be an LSP server; read the children list. | `$NV interrupt` cancels it. Or kill only that child PID, not Neovim. |
 | **Busy**: Vimscript infinite loop or huge operation | No answer, high CPU | `$NV interrupt` |
 | **Busy: pure-Lua infinite loop** | No answer, high CPU, and `interrupt` says "could not deliver CTRL-C" | Only `$NV kill -9`. Lua loops never check for interrupts and ignore SIGTERM. |

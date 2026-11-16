@@ -120,7 +120,7 @@ logical change. If the file isn't open (exit 3), use your normal tools.
 2. **Edit, don't save** (the default): the agent's change joins yours in the buffer, and it stops until you save.
 3. **Save, edit, save**: the agent saves your work first, then makes its change and saves again. `u` still reverts just the agent's change.
 
-If the file also changed on disk, you typed in it mid-edit, or anything else unexpected comes up, the agent stops and tells you rather than forcing a save. If your Neovim ends up asking a question (like "file has been changed since reading it"), the agent leaves the answer to you.
+If the file also changed on disk, you typed in it mid-edit, or anything else unexpected comes up, the agent stops and tells you rather than forcing a save. If your Neovim ends up asking a question (like "file has been changed since reading it"), the agent leaves the answer to you — and `nv` itself refuses keystrokes that would answer that confirm (except declining with `send n` on an unattended managed server).
 
 A lighter option: let the agent edit files normally, then refresh your editor:
 
